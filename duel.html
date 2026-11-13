@@ -311,6 +311,13 @@ const Sfx = (() => {
       noise(t, far ? 0.5 : 0.42, 0.95 * v, 'lowpass', far ? 1800 : 3200, 220, { echo: 0.6 });
       tone(far ? 120 : 160, 'sine', t, 0.22, 0.9 * v, { to: 42, glide: 0.14 });
     },
+    heart(vol) { if (ok()) beat(ac.currentTime + 0.01, vol); },
+    bell() {                       // a distant church bell
+      if (!ok()) return;
+      const t = ac.currentTime;
+      [[1, 0.16, 3.2], [2.0, 0.09, 2.4], [2.76, 0.07, 1.8], [5.4, 0.035, 1.1], [8.93, 0.02, 0.6]].forEach(([m, v, d]) => tone(196 * m, 'sine', t, d, v, { attack: 0.004, echo: 0.5 }));
+      noise(t, 0.05, 0.1, 'bandpass', 1800, 0, { q: 2 });
+    },
     whiz() { if (ok()) noise(ac.currentTime, 0.22, 0.35, 'bandpass', 3800, 700, { q: 6 }); },
     thud(heavy) {
       if (!ok()) return;
@@ -362,10 +369,6 @@ const Sfx = (() => {
       droneGain.gain.setTargetAtTime(p.music * (0.05 + 0.13 * p.tension), t, 0.3);
       droneLP.frequency.setTargetAtTime(180 + 700 * p.tension, t, 0.3);
       tremGain.gain.setTargetAtTime(p.music * 0.05 * Math.pow(p.tension, 1.5), t, 0.3);
-      if (p.heart) {
-        if (nextBeat < t - 0.1) nextBeat = t + 0.03;
-        if (t >= nextBeat - 0.05) { beat(Math.max(t, nextBeat), p.heartVol); nextBeat += 60 / p.bpm; }
-      }
       if (p.pluck) {
         if (nextPluck < t - 0.5) nextPluck = t + 0.5;
         if (t >= nextPluck - 0.05) {
@@ -461,6 +464,28 @@ function viewProj() {
   return o;
 }
 
+// a free camera for the cinematic inset panels: looks from pos at target, framing fieldW metres across rect
+function panelCam(pos, target, rect, fieldW) {
+  const fwd = vnorm(vsub(target, pos)), right = vnorm(vcross([0, 1, 0], fwd)), up = vcross(fwd, right);
+  return { pos, R: m3cols(right, up, fwd), f: rect.w * vlen(vsub(target, pos)) / fieldW, rect };
+}
+function panelVP(c) {
+  const Rt = m3T(c.R), t = vmul(m3v(Rt, c.pos), -1), A = (FAR + NEAR) / (FAR - NEAR), B = -2 * FAR * NEAR / (FAR - NEAR);
+  const kx = 2 * c.f / c.rect.w, ky = 2 * c.f / c.rect.h, o = new Float32Array(16);
+  for (let i = 0; i < 3; i++) { o[i * 4] = kx * Rt[i]; o[i * 4 + 1] = ky * Rt[3 + i]; o[i * 4 + 2] = A * Rt[6 + i]; o[i * 4 + 3] = Rt[6 + i]; }
+  o[12] = kx * t[0]; o[13] = ky * t[1]; o[14] = A * t[2] + B; o[15] = t[2];
+  return o;
+}
+// where the two stare-down panels sit on screen (css px); a = how far each has opened
+function panelRects() {
+  const w1 = Math.min(W * 0.54, H * 1.0), h1 = w1 * 0.19, a = easeOut(fx.panelA), b = easeOut(fx.panelB);
+  const w2 = Math.min(W * 0.21, H * 0.33), h2 = w2 * 1.3, x2 = Math.min(W - w2 - 14 * S, W * 0.77);
+  return {
+    eyes: { x: W / 2 - w1 * a / 2, y: H * 0.105, w: Math.max(1, w1 * a), h: h1, full: w1 },
+    hand: { x: x2, y: H * 0.43 + h2 * (1 - b) / 2, w: w2, h: Math.max(1, h2 * b), full: h2 },
+  };
+}
+
 function resize() {
   DPR = Math.min(window.devicePixelRatio || 1, 2);
   W = Math.max(320, window.innerWidth);
@@ -524,12 +549,12 @@ void main(){ vec4 w=uModel*vec4(aPos,1.); vP=w.xyz; vObj=aPos; vN=mat3(uModel)*a
 
 const VS_SKIN = `#version 300 es
 layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNor; layout(location=2) in vec4 aCol;
-layout(location=3) in vec4 aMat; layout(location=4) in vec4 aBone; layout(location=5) in vec4 aWgt;
+layout(location=3) in vec4 aMat; layout(location=4) in vec4 aBone; layout(location=5) in vec4 aWgt; layout(location=6) in vec2 aUv;
 uniform mat4 uVP; uniform mat4 uBones[16];
 out vec3 vP; out vec3 vN; out vec3 vObj; out vec4 vCol; out vec4 vMat; out vec2 vUv;
 void main(){
   mat4 sk=uBones[int(aBone.x)]*aWgt.x+uBones[int(aBone.y)]*aWgt.y+uBones[int(aBone.z)]*aWgt.z+uBones[int(aBone.w)]*aWgt.w;
-  vec4 w=sk*vec4(aPos,1.); vP=w.xyz; vObj=aPos; vN=mat3(sk)*aNor; vCol=aCol; vMat=aMat; vUv=vec2(0.); gl_Position=uVP*w; }`;
+  vec4 w=sk*vec4(aPos,1.); vP=w.xyz; vObj=aPos; vN=mat3(sk)*aNor; vCol=aCol; vMat=aMat; vUv=aUv; gl_Position=uVP*w; }`;
 
 const VS_DEPTH_STATIC = `#version 300 es
 layout(location=0) in vec3 aPos; uniform mat4 uVP, uModel;
@@ -551,8 +576,17 @@ ${GLSL_COMMON}
 in vec3 vP; in vec3 vN; in vec3 vObj; in vec4 vCol; in vec4 vMat; in vec2 vUv;
 uniform vec3 uCam, uSunCol, uFillDir, uFillCol, uSkyAmb, uGndAmb, uGlowAmb, uFlashCol;
 uniform mat4 uLightVP; uniform sampler2DShadow uShadow; uniform sampler2D uAtlas;
-uniform vec4 uFlash; uniform float uTwoSided, uShadowTexel, uTime, uFog;
+uniform vec4 uFlash; uniform float uTwoSided, uShadowTexel, uTime, uFog, uTexOn;
+uniform sampler2D uGround, uGroundN, uWood, uWoodN, uCloth, uClothN, uLeather, uLeatherN, uEye, uProp, uPropN, uPropE;
 out vec4 o;
+vec3 nmap(sampler2D s, vec2 uv){ return texture(s,uv).xyz*2.-1.; }
+// tilt normal N by a tangent-space normal, building the tangent frame from screen-space derivatives
+vec3 bump(vec3 N, vec3 tn, vec3 dpx, vec3 dpy, vec2 dux, vec2 duy){
+  vec3 a=cross(dpy,N), b=cross(N,dpx);
+  vec3 T=a*dux.x+b*duy.x, B=a*dux.y+b*duy.y;
+  float im=inversesqrt(max(dot(T,T),dot(B,B))+1e-20);
+  return normalize(T*im*tn.x+B*im*tn.y+N*tn.z);
+}
 
 float shadowAt(vec3 p, vec3 n){
   vec4 lp=uLightVP*vec4(p+n*0.03,1.); vec3 s=lp.xyz*0.5+0.5;
@@ -584,12 +618,14 @@ void main(){
   vec3 N=normalize(vN), V=normalize(uCam-vP);
   if(uTwoSided>.5 && dot(N,V)<0.) N=-N;
   vec3 alb=vCol.rgb; float ao=vCol.a, rough=vMat.x, metal=vMat.y, emis=vMat.w; int pat=int(vMat.z+.5);
-  vec3 emit=vec3(0.); float fuzz=0.25;
+  vec3 emit=vec3(0.); float fuzz=0.25, skin=0.;
+  vec3 dpx=dFdx(vP), dpy=dFdy(vP); vec2 dux=dFdx(vUv), duy=dFdy(vUv);
   if(pat==1){                 // horizontal clapboard siding (uv in metres)
     float pv=vUv.y/0.17, pi=floor(pv), pf=fract(pv);
     float brd=hash21(vec2(pi, floor(vUv.x/2.7+hash21(vec2(pi,3.))*5.)));
-    float grain=fbm(vec2(vUv.x*3., vUv.y*46.)+pi*7.3);
-    alb*=(0.74+0.42*brd)*(0.78+0.44*grain);
+    if(uTexOn>.5){ vec2 tuv=vec2(vUv.x*0.5+hash21(vec2(pi,5.))*7., vUv.y*0.5);
+      alb*=texture(uWood,tuv).rgb*2.*(0.78+0.4*brd); N=bump(N,normalize(nmap(uWoodN,tuv)*vec3(.45,.45,1.)),dpx,dpy,dux,duy);
+    } else { float grain=fbm(vec2(vUv.x*3., vUv.y*46.)+pi*7.3); alb*=(0.74+0.42*brd)*(0.78+0.44*grain); }
     float gr=smoothstep(0.,.1,pf)*smoothstep(1.,.93,pf);
     alb*=0.4+0.6*gr; ao*=0.7+0.3*gr;
     if(abs(N.y)<0.7) N=normalize(N+vec3(0.,1.,0.)*(0.5-pf)*0.3);
@@ -597,15 +633,17 @@ void main(){
   } else if(pat==6){          // vertical boards
     float pv=vUv.x/0.21, pi=floor(pv), pf=fract(pv);
     float brd=hash21(vec2(pi,11.));
-    float grain=fbm(vec2(vUv.x*46., vUv.y*3.)+pi*5.1);
-    alb*=(0.76+0.4*brd)*(0.78+0.44*grain);
+    if(uTexOn>.5){ vec2 tuv=vec2(vUv.y*0.5+hash21(vec2(pi,5.))*7., vUv.x*0.5);
+      alb*=texture(uWood,tuv).rgb*2.*(0.8+0.38*brd); N=bump(N,normalize(nmap(uWoodN,tuv)*vec3(.45,.45,1.)),dpx,dpy,dux.yx,duy.yx);
+    } else { float grain=fbm(vec2(vUv.x*46., vUv.y*3.)+pi*5.1); alb*=(0.76+0.4*brd)*(0.78+0.44*grain); }
     float gr=smoothstep(0.,.08,pf)*smoothstep(1.,.92,pf);
     alb*=0.4+0.6*gr; ao*=0.7+0.3*gr;
   } else if(pat==2){          // floor planks, boards spaced along v
     float pv=vUv.y/0.2, pi=floor(pv), pf=fract(pv);
     float brd=hash21(vec2(pi,23.));
-    float grain=fbm(vec2(vUv.x*3., vUv.y*40.)+pi*3.3);
-    alb*=(0.72+0.45*brd)*(0.75+0.5*grain);
+    if(uTexOn>.5){ vec2 tuv=vec2(vUv.x*0.5+hash21(vec2(pi,9.))*7., vUv.y*0.5);
+      alb*=texture(uWood,tuv).rgb*2.*(0.76+0.42*brd); N=bump(N,normalize(nmap(uWoodN,tuv)*vec3(.45,.45,1.)),dpx,dpy,dux,duy);
+    } else { float grain=fbm(vec2(vUv.x*3., vUv.y*40.)+pi*3.3); alb*=(0.72+0.45*brd)*(0.75+0.5*grain); }
     float gr=smoothstep(0.,.07,pf)*smoothstep(1.,.93,pf);
     alb*=0.35+0.65*gr; ao*=0.7+0.3*gr;
   } else if(pat==3){          // packed dirt street
@@ -621,6 +659,13 @@ void main(){
     alb=mix(alb, vec3(0.30,0.25,0.21)*(0.5+hash21(ci+1.3)), peb);
     ao*=0.75+0.25*smoothstep(-0.3,0.4,h0);
     rough=0.92;
+    if(uTexOn>.5){              // real dirt texture at two scales, tinted by the broad colour variation
+      vec2 g1=g*0.26, g2=vec2(g.x*0.8+g.y*0.6, g.y*0.8-g.x*0.6)*0.083+0.37;
+      vec3 ta=pow(texture(uGround,g1).rgb,vec3(2.2)), tb=pow(texture(uGround,g2).rgb,vec3(2.2));
+      alb=mix(ta,tb,0.4)*(0.62+0.7*n1)*(1.-0.4*rutf(g));
+      vec3 tn=nmap(uGroundN,g1);
+      N=normalize(vec3(N.x+tn.x*0.8, N.y, N.z+tn.y*0.8));
+    }
   } else if(pat==4){          // window glass: lamplit or dark and reflective
     if(emis>0.5){
       float cur=smoothstep(0.16,0.34,abs(vUv.x-0.5));
@@ -630,7 +675,25 @@ void main(){
     } else { alb=vec3(0.012,0.014,0.018); rough=0.07; }
   } else if(pat==5){          // painted sign from the text atlas
     alb=pow(texture(uAtlas,vUv).rgb,vec3(2.2)); rough=0.8;
-  } else if(pat==7 || pat==8){ // cloth / felt (7), leather and wood (8)
+  } else if((pat==7 || pat==8) && uTexOn>.5){   // cloth and leather from texture files, projected along three axes
+    vec3 w=pow(abs(N),vec3(4.)); w/=(w.x+w.y+w.z);
+    float sc=pat==7?8.3:5.;
+    vec2 ux=vObj.zy*sc, uy=vObj.xz*sc, uz=vObj.xy*sc; vec3 a, nx, ny, nz;
+    if(pat==7){ a=texture(uCloth,ux).rgb*w.x+texture(uCloth,uy).rgb*w.y+texture(uCloth,uz).rgb*w.z; nx=nmap(uClothN,ux); ny=nmap(uClothN,uy); nz=nmap(uClothN,uz); }
+    else { a=texture(uLeather,ux).rgb*w.x+texture(uLeather,uy).rgb*w.y+texture(uLeather,uz).rgb*w.z; nx=nmap(uLeatherN,ux); ny=nmap(uLeatherN,uy); nz=nmap(uLeatherN,uz); }
+    alb*=mix(vec3(1.),a*2.,0.8);
+    N=normalize(N+(vec3(0.,nx.y,nx.x)*w.x+vec3(ny.x,0.,ny.y)*w.y+vec3(nz.x,nz.y,0.)*w.z)*(pat==7?0.55:0.4));
+    fuzz=pat==7?0.5:0.25;
+  } else if(pat==9){          // skin
+    skin=1.; fuzz=0.35;
+    N=normalize(N+(vec3(vnoise3(vObj*700.),vnoise3(vObj*700.+9.),vnoise3(vObj*700.+17.))-.5)*0.06);
+  } else if(pat==10){         // eyeball texture
+    alb=pow(texture(uEye,vUv).rgb,vec3(2.2)); rough=0.12; ao*=0.85;
+  } else if(pat==11){         // textured prop (the lantern)
+    alb=pow(texture(uProp,vUv).rgb,vec3(2.2)); N=bump(N,nmap(uPropN,vUv),dpx,dpy,dux,duy);
+    float flick=0.9+0.1*sin(uTime*11.+vP.z*2.)*sin(uTime*4.3+vP.x);
+    emit=pow(texture(uPropE,vUv).rgb,vec3(2.2))*4.*flick; rough=0.55;
+  } else if(pat==7 || pat==8){ // cloth / felt (7), leather and wood (8), procedural fallback
     float fq=pat==7?130.:210., amp=pat==7?0.13:0.1;
     vec3 q=vObj*fq; q=vec3(q.x*0.8+q.z*0.6, q.y+q.x*0.31, q.z*0.8-q.x*0.6);
     vec3 q2=vec3(q.y*0.7-q.z*0.71, q.x*1.9, q.y*0.71+q.z*0.7)*2.3+7.;
@@ -658,6 +721,8 @@ void main(){
   // light scattering through fuzz and dust at grazing angles, toward the sun
   float rim=pow(1.-nv,3.)*pow(max(dot(-V,uSunDir),0.),2.);
   col+=uSunCol*(alb+0.04)*rim*fuzz*0.9*sh*(1.-metal);
+  // light bleeding through skin near the shadow line
+  col+=skin*alb*uSunCol*sh*vec3(0.55,0.14,0.07)*smoothstep(-0.45,0.05,dot(N,uSunDir))*(1.-max(dot(N,uSunDir),0.))*0.45;
   if(uFlash.w>0.){ vec3 fl=uFlash.xyz-vP; float d2=dot(fl,fl);
     col+=(alb*(1.-metal)+F0*0.5)*uFlashCol*uFlash.w*max(dot(N,normalize(fl))*0.8+0.2,0.)/(1.+d2*1.2); }
   col+=emit;
@@ -675,12 +740,12 @@ void main(){ vec2 p=vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2)); vUv=p
 const FS_SKY = `#version 300 es
 precision highp float;
 ${GLSL_COMMON}
-in vec2 vUv; uniform vec3 uRow0, uRow1; uniform vec4 uView; uniform float uRS, uTime;
+in vec2 vUv; uniform vec3 uRow0, uRow1; uniform vec4 uView; uniform float uRS, uTime; uniform mat3 uCamR;
 out vec4 o;
 void main(){
   vec2 px=vec2(gl_FragCoord.x/uRS, uView.w-gl_FragCoord.y/uRS);
   vec2 w=vec2(dot(uRow0,vec3(px,1.)), dot(uRow1,vec3(px,1.)));
-  vec3 d=normalize(vec3((w.x-uView.x)/uView.z, -(w.y-uView.y)/uView.z, 1.));
+  vec3 d=uCamR*normalize(vec3((w.x-uView.x)/uView.z, -(w.y-uView.y)/uView.z, 1.));
   vec3 c=skyBase(d);
   float sd=max(dot(d,uSunDir),0.);
   if(d.y>0.004){               // streaky clouds, lit from below by the low sun
@@ -747,12 +812,13 @@ void main(){
   o=vec4(c,1.);
 }`;
 const FS_FINAL = `#version 300 es
-precision highp float; in vec2 vUv; uniform sampler2D uTex, uBloom; uniform float uBloomK; out vec4 o;
+precision highp float; in vec2 vUv; uniform sampler2D uTex, uBloom; uniform float uBloomK, uTense; out vec4 o;
 void main(){
   vec3 c=texture(uTex,vUv).rgb+texture(uBloom,vUv).rgb*uBloomK;
   float l=dot(c,vec3(0.3,0.59,0.11));
-  c=clamp(mix(vec3(l),c,1.08),0.,1.);            // a touch more saturation
-  c=c*c*(3.-2.*c)*0.35+c*0.65;                   // gentle filmic contrast
+  c=clamp(mix(vec3(l),c,mix(1.08,0.72,uTense)),0.,1.);   // drains toward a bleached look as tension builds
+  float k=mix(0.35,0.7,uTense);
+  c=c*c*(3.-2.*c)*k+c*(1.-k);                    // filmic contrast, harder under tension                   // gentle filmic contrast
   o=vec4(c,1.);
 }`;
 
@@ -771,11 +837,12 @@ function mkProg(vs, fs) {
   return { p, u: n => (n in cache ? cache[n] : (cache[n] = gl.getUniformLocation(p, n))) };
 }
 
-// vertex layouts: static = pos3 nor3 col4 mat4 uv2 (16 floats); skin = pos3 nor3 col4 mat4 bone4 wgt4 (22)
+// vertex layouts: static = pos3 nor3 col4 mat4 uv2 (16 floats); skin = pos3 nor3 col4 mat4 bone4 wgt4 uv2 (24)
+const SKV = 24;
 function mkMesh(kind, verts, idx) {
   const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
   const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
-  const sizes = kind === 'skin' ? [3, 3, 4, 4, 4, 4] : [3, 3, 4, 4, 2];
+  const sizes = kind === 'skin' ? [3, 3, 4, 4, 4, 4, 2] : [3, 3, 4, 4, 2];
   const stride = sizes.reduce((a, b) => a + b, 0) * 4;
   let off = 0;
   sizes.forEach((n, i) => { gl.enableVertexAttribArray(i); gl.vertexAttribPointer(i, n, gl.FLOAT, false, stride, off); off += n * 4; });
@@ -859,6 +926,85 @@ function glInit() {
   gl.bindVertexArray(null);
   R.ok = true;
   return true;
+}
+
+/* =====================================================================
+   6b. ASSET FILES — optional models (glTF binary) and textures in assets/.
+       They load over http(s). Opened straight from disk, browsers block
+       them, and the game falls back to its built-in sculpted models and
+       procedural surfaces.
+   ===================================================================== */
+const ASSETS = { ok: false, tex: {}, models: {} };
+const ASSET_DIR = 'assets/';
+const TEXTURE_FILES = ['ground_albedo', 'ground_normal', 'wood_albedo', 'wood_normal', 'cloth_albedo', 'cloth_normal', 'leather_albedo', 'leather_normal',
+  'eye_blue', 'eye_brown', 'lantern_baseColor', 'lantern_normal', 'lantern_emissive'];
+const MODEL_FILES = ['head_a', 'head_b', 'hand_open', 'hand_grip', 'lantern'];
+
+function mkTexture(img) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, img);     // throws if the image is not readable (file://)
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  const an = gl.getExtension('EXT_texture_filter_anisotropic');
+  if (an) gl.texParameterf(gl.TEXTURE_2D, an.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, gl.getParameter(an.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+  return t;
+}
+function loadTexture(name) {
+  return new Promise((ok, fail) => {
+    const img = new Image();
+    img.onload = () => { try { ok(mkTexture(img)); } catch (e) { fail(e); } };
+    img.onerror = () => fail(new Error('missing ' + name));
+    img.src = ASSET_DIR + 'textures/' + name + '.jpg';
+  });
+}
+// minimal glTF-binary reader: triangle meshes with positions, normals, colours, uvs
+async function loadGLB(name) {
+  const res = await fetch(ASSET_DIR + 'models/' + name + '.glb');
+  if (!res.ok) throw new Error('missing ' + name);
+  const buf = await res.arrayBuffer(), dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== 0x46546C67) throw new Error('not a glb: ' + name);
+  const jl = dv.getUint32(12, true), g = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 20, jl))), bin = 20 + jl + 8;
+  const read = i => {
+    const a = g.accessors[i], v = g.bufferViews[a.bufferView], n = { SCALAR: 1, VEC2: 2, VEC3: 3, VEC4: 4 }[a.type];
+    const off = bin + (v.byteOffset || 0) + (a.byteOffset || 0), Ty = { 5126: Float32Array, 5125: Uint32Array, 5123: Uint16Array }[a.componentType];
+    return { data: new Ty(buf.slice(off, off + a.count * n * Ty.BYTES_PER_ELEMENT)), n, count: a.count };
+  };
+  const prims = [];
+  for (const m of g.meshes) for (const p of m.primitives) {
+    const at = p.attributes, mat = g.materials[p.material] || {};
+    prims.push({
+      name: mat.name || '', pos: read(at.POSITION).data, nor: read(at.NORMAL).data,
+      col: at.COLOR_0 !== undefined ? read(at.COLOR_0) : null, uv: at.TEXCOORD_0 !== undefined ? read(at.TEXCOORD_0).data : null,
+      idx: read(p.indices).data, rough: (mat.pbrMetallicRoughness || {}).roughnessFactor,
+    });
+  }
+  return { prims, extras: (g.asset && g.asset.extras) || {} };
+}
+async function loadAssets() {
+  try {
+    const [tex, models] = await Promise.all([Promise.all(TEXTURE_FILES.map(loadTexture)), Promise.all(MODEL_FILES.map(loadGLB))]);
+    TEXTURE_FILES.forEach((n, i) => { ASSETS.tex[n] = tex[i]; });
+    MODEL_FILES.forEach((n, i) => { ASSETS.models[n] = models[i]; });
+    ASSETS.ok = true;
+  } catch (e) { ASSETS.ok = false; ASSETS.error = String(e && e.message || e); }
+  // every sampler needs something bound, so missing textures get a grey pixel
+  ASSETS.blank = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, ASSETS.blank);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([128, 128, 128, 255]));
+}
+
+// skinned-format vertices (24 floats) from a loaded model part, rigidly attached to one bone
+function modelVerts(prim, xf, boneI, pattern, tint) {
+  const n = prim.pos.length / 3, out = new Float32Array(n * SKV), R0 = xf ? xf.R : I3, t0 = xf ? xf.t : [0, 0, 0];
+  for (let i = 0; i < n; i++) {
+    const p = vadd(m3v(R0, [prim.pos[i * 3], prim.pos[i * 3 + 1], prim.pos[i * 3 + 2]]), t0), nr = m3v(R0, [prim.nor[i * 3], prim.nor[i * 3 + 1], prim.nor[i * 3 + 2]]);
+    const o = i * SKV, cn = prim.col ? prim.col.n : 0;
+    out[o] = p[0]; out[o + 1] = p[1]; out[o + 2] = p[2]; out[o + 3] = nr[0]; out[o + 4] = nr[1]; out[o + 5] = nr[2];
+    for (let c = 0; c < 3; c++) out[o + 6 + c] = (cn ? prim.col.data[i * cn + c] : 1) * tint[c];
+    out[o + 9] = 1; out[o + 10] = prim.rough === undefined ? 0.6 : prim.rough; out[o + 11] = 0; out[o + 12] = pattern; out[o + 13] = 0;
+    out[o + 14] = boneI; out[o + 18] = 1;
+    if (prim.uv) { out[o + 22] = prim.uv[i * 2]; out[o + 23] = prim.uv[i * 2 + 1]; }
+  }
+  return out;
 }
 
 /* =====================================================================
@@ -1232,6 +1378,22 @@ function buildTown() {
   return { mesh: g.mesh(), groundCount };
 }
 
+// street lanterns from the loaded prop model
+function buildLantern() {
+  if (!ASSETS.ok) return;
+  const pr = ASSETS.models.lantern.prims[0], n = pr.pos.length / 3, v = new Float32Array(n * 16);
+  for (let i = 0; i < n; i++) {
+    const o = i * 16;
+    for (let c = 0; c < 3; c++) { v[o + c] = pr.pos[i * 3 + c]; v[o + 3 + c] = pr.nor[i * 3 + c]; v[o + 6 + c] = 1; }
+    v[o + 9] = 1; v[o + 10] = 0.55; v[o + 11] = 0; v[o + 12] = 11; v[o + 13] = 1; v[o + 14] = pr.uv[i * 2]; v[o + 15] = pr.uv[i * 2 + 1];
+  }
+  const at = [];
+  for (const [x, z] of [[-3.3, 6.2], [-3.3, 25.5], [-3.3, 43], [3.3, 11], [3.3, 28.5], [3.3, 44]]) {
+    const m = new Float32Array(16); mat4RT(x < 0 ? I3 : rotY(Math.PI), [x, 0, z], m, 0); at.push(m);
+  }
+  R.lantern = { mesh: mkMesh('static', v, new Uint32Array(pr.idx)), at };
+}
+
 // a tumbleweed: tangled loops of dry stalk
 function buildWeed() {
   const g = new Geo(), rng = mulberry32(909), m = mat([150, 112, 62], 0.9);
@@ -1375,7 +1537,7 @@ function sdEval(D, list, n, x, y, z, rich) {
   return d;
 }
 
-// Turn a sculpt into a mesh (surface nets on a sparse grid). Returns skinned vertices (22 floats each).
+// Turn a sculpt into a mesh (surface nets on a sparse grid). Returns skinned vertices (SKV floats each).
 function polygonize(sc, bmin, bmax, h, bn, mats, rigidBone) {
   const D = sc.flat(), np = sc.n, B = h * bn;
   const bx = Math.max(1, Math.ceil((bmax[0] - bmin[0]) / B)), by = Math.max(1, Math.ceil((bmax[1] - bmin[1]) / B)), bz = Math.max(1, Math.ceil((bmax[2] - bmin[2]) / B));
@@ -1471,7 +1633,7 @@ function polygonize(sc, bmin, bmax, h, bn, mats, rigidBone) {
   }
 
   // per-vertex material, skin weights and ambient occlusion
-  const out = new Float32Array(nv * 22), bw = new Float64Array(16);
+  const out = new Float32Array(nv * SKV), bw = new Float64Array(16);
   for (let v = 0; v < nv; v++) {
     const L = lists[cellBlock[v]];
     const e = h * 0.5, ev = (a, b, c) => sdEval(D, L, L.length, a, b, c, false);
@@ -1494,7 +1656,7 @@ function polygonize(sc, bmin, bmax, h, bn, mats, rigidBone) {
     let ao = 0;
     for (const s of [0.015, 0.04, 0.09]) ao += clamp(sdEval(D, L, L.length, x + nxn * s, y + nyn * s, z + nzn * s, false) / s, 0, 1);
     ao = 0.3 + 0.7 * Math.pow(ao / 3, 0.8);
-    const o = v * 22;
+    const o = v * SKV;
     out[o] = x; out[o + 1] = y; out[o + 2] = z; out[o + 3] = nxn; out[o + 4] = nyn; out[o + 5] = nzn;
     out[o + 6] = m.c[0]; out[o + 7] = m.c[1]; out[o + 8] = m.c[2]; out[o + 9] = ao;
     out[o + 10] = m.r; out[o + 11] = m.m; out[o + 12] = m.p; out[o + 13] = 0;
@@ -1626,6 +1788,25 @@ function sculptHead(o) {
   return sc;
 }
 
+// hair, brows and moustache fitted to a loaded head model (E = landmark points saved with the model)
+function sculptHair(o, E) {
+  const sc = new Sculpt(), hr = { mat: MT.hair, bone: BONE.head, k: 0.01, na: 0.003, nf: 70 };
+  sc.ell([0, 1.668, -0.03], [E.halfWidth - 0.004, 0.098, 0.1], hr);
+  sc.ell([0, 1.59, E.back + 0.055], [0.062, 0.05, 0.045], hr);
+  sc.box([0, 1.62, 0.16], [0.2, 0.2, 0.115], 0.02, { sub: true, k: 0.02 });                 // keep the face clear
+  for (const s of [1, -1]) {
+    sc.caps([s * (E.halfWidth - 0.019), 1.675, 0.036], [s * (E.halfWidth - 0.021), 1.63, 0.042], 0.008, 0.005, hr);   // sideburns
+    const b = s > 0 ? E.browR : E.browL, lift = p => [p[0], p[1] + 0.002, p[2] + 0.0025];
+    sc.caps(lift(b[0]), lift(b[1]), 0.0042, 0.0046, { mat: MT.hair, bone: BONE.head, k: 0.003 });
+    sc.caps(lift(b[1]), lift(b[2]), 0.0046, 0.003, { mat: MT.hair, bone: BONE.head, k: 0.003 });
+    if (o.mustache) {
+      const m = E.lipTop || E.mouth, a = [s * 0.004, m[1] + 0.009, m[2] + 0.004], c = [s * 0.036, m[1] - 0.006, m[2] - 0.016];
+      sc.caps(a, c, 0.0085, 0.0058, hr); sc.caps(c, [s * 0.046, m[1] - 0.03, m[2] - 0.03], 0.0058, 0.003, hr);
+    }
+  }
+  return sc;
+}
+
 function sculptHat() {
   const sc = new Sculpt(), ht = { mat: MT.hat, bone: BONE.head, k: 0.014 };
   const tilt = rotX(-0.1);
@@ -1704,8 +1885,8 @@ function buildGun() {
 }
 
 const PALETTES = {
-  opp: { coat: [44, 34, 30], vest: [104, 44, 34], shirt: [196, 182, 152], pants: [58, 50, 46], boot: [34, 24, 20], belt: [96, 60, 34], bandana: [156, 38, 30], skin: [198, 142, 106], hair: [36, 26, 20], hat: [30, 24, 22], band: [120, 42, 30] },
-  player: { leather: true, coat: [96, 62, 38], vest: [150, 126, 92], shirt: [158, 142, 114], pants: [60, 66, 82], boot: [58, 38, 26], belt: [92, 56, 30], bandana: [46, 78, 104], skin: [188, 136, 100], hair: [70, 48, 32], hat: [164, 128, 88], band: [48, 32, 24] },
+  opp: { coat: [44, 34, 30], vest: [104, 44, 34], shirt: [196, 182, 152], pants: [58, 50, 46], boot: [34, 24, 20], belt: [96, 60, 34], bandana: [156, 38, 30], skin: [204, 143, 107], hair: [36, 26, 20], hat: [30, 24, 22], band: [120, 42, 30] },
+  player: { leather: true, coat: [96, 62, 38], vest: [150, 126, 92], shirt: [158, 142, 114], pants: [60, 66, 82], boot: [58, 38, 26], belt: [92, 56, 30], bandana: [46, 78, 104], skin: [194, 138, 102], hair: [70, 48, 32], hat: [164, 128, 88], band: [48, 32, 24] },
 };
 
 // q: quality multiplier for voxel size (1 = hero detail)
@@ -1720,19 +1901,42 @@ function buildCharacter(o) {
   };
   const q = o.q * CONFIG.gfx.detail;
   add('body', sculptBody(o), [-0.72, -0.01, -0.31], [0.72, 1.58, 0.31], 0.008 * q, 5);
-  add('head', sculptHead(o), [-0.12, 1.4, -0.14], [0.12, 1.78, 0.15], 0.005 * Math.max(1, q), 5, BONE.head);
-  add('hat', sculptHat(), [-0.26, 1.67, -0.27], [0.26, 1.92, 0.27], 0.005 * Math.max(1, q), 5, BONE.head);
+  const raw = (name, chunks) => {                       // parts that come from model files
+    parts[name] = { start: I.length, count: 0 };
+    for (const [verts, idx] of chunks) {
+      for (let i = 0; i < idx.length; i++) I.push(idx[i] + nv);
+      parts[name].count += idx.length; V.push(verts); nv += verts.length / SKV;
+    }
+  };
+  const ext = ASSETS.ok ? ASSETS.models : null;
+  if (ext) {
+    const H = ext[o.headFile];
+    raw('head', H.prims.map(pr => [modelVerts(pr, null, BONE.head, pr.name === 'eye' ? 10 : 9, [1, 1, 1]), pr.idx]));
+    add('hair', sculptHair(o, H.extras), [-0.13, 1.5, -0.16], [0.13, 1.76, 0.16], 0.0028 * Math.max(1, q), 5, BONE.head);
+  } else {
+    add('head', sculptHead(o), [-0.12, 1.4, -0.14], [0.12, 1.78, 0.15], 0.005 * Math.max(1, q), 5, BONE.head);
+    parts.hair = { start: I.length, count: 0 };
+  }
+  add('hat', sculptHat(), [-0.26, 1.67, -0.27], [0.26, 1.92, 0.27], 0.0036, 5, BONE.head);
   add('belt', sculptBelt(o.belt), [-0.3, 0.62, -0.24], [0.33, 1.08, 0.24], (o.belt.cartridges ? 0.0032 : 0.006), 5, BONE.pelvis);
   const hb = (c, r) => [[c[0] - r, c[1] - r, c[2] - r], [c[0] + r, c[1] + r, c[2] + r]];
   const hc = vadd(BJ.wrR, vmul(ARMD, 0.06)), hl = mirror(hc), hh = 0.003 * (q > 1.2 ? 1.5 : 1);
-  add('handR', sculptHand(1, false), hb(hc, 0.14)[0], hb(hc, 0.14)[1], hh, 5, BONE.handR);
-  add('gripR', sculptHand(1, true), hb(hc, 0.14)[0], hb(hc, 0.14)[1], hh, 5, BONE.handR);
-  add('handL', sculptHand(-1, false), hb(hl, 0.14)[0], hb(hl, 0.14)[1], hh, 5, BONE.handL);
+  if (ext) {
+    const ref = lin([199, 140, 105]), sk = lin(o.pal.skin), tint = [sk[0] / ref[0], sk[1] / ref[1], sk[2] / ref[2]];
+    const hand = (file, sd) => ext[file].prims.map(pr => [modelVerts(pr, { R: HANDF[sd], t: sd > 0 ? BJ.wrR : BJ.wrL }, sd > 0 ? BONE.handR : BONE.handL, 9, tint), pr.idx]);
+    raw('handR', hand('hand_open', 1)); raw('gripR', hand('hand_grip', 1)); raw('handL', hand('hand_open', -1));
+  } else {
+    add('handR', sculptHand(1, false), hb(hc, 0.14)[0], hb(hc, 0.14)[1], hh, 5, BONE.handR);
+    add('gripR', sculptHand(1, true), hb(hc, 0.14)[0], hb(hc, 0.14)[1], hh, 5, BONE.handR);
+    add('handL', sculptHand(-1, false), hb(hl, 0.14)[0], hb(hl, 0.14)[1], hh, 5, BONE.handL);
+  }
   let tot = 0; for (const a of V) tot += a.length;
   const all = new Float32Array(tot); let off = 0;
   for (const a of V) { all.set(a, off); off += a.length; }
-  const holster = { R: GUN_HOLSTER.R, t: [o.belt.rx + 0.026, 0.975 - o.belt.slant, -0.03] };
-  return { mesh: mkMesh('skin', all, new Uint32Array(I)), parts, tris: I.length / 3, holster };
+  const E = ext ? ext[o.headFile].extras : null;
+  const eyeMid = E ? vmul(vadd(E.eyeR, E.eyeL), 0.5) : [0, 1.643, 0.086];
+  const holster = { R: GUN_HOLSTER.R, t: [o.belt.rx + 0.02, 0.972 - o.belt.slant, -0.014] };
+  return { mesh: mkMesh('skin', all, new Uint32Array(I)), parts, tris: I.length / 3, holster, eyeMid };
 }
 
 /* ---- skeleton: joint positions in, one rigid transform per bone out ---- */
@@ -1960,7 +2164,8 @@ const pick = a => a[(Math.random() * a.length) | 0];
 let duel = null;
 const particles = [], props = [];
 const sway = { x: 0, y: 0, amp: 0, jx: 0, jy: 0, t: rand(0, 100) };
-const fx = { muzzle: 0, seed: 0, hurt: 0, fade: 0, lb: 0, focusK: 0, honorShown: 0.5, honorFlash: 0 };
+const fx = { muzzle: 0, seed: 0, hurt: 0, fade: 0, lb: 0, focusK: 0, honorShown: 0.5, honorFlash: 0,
+  panelA: 0, panelB: 0, pulse: 0, beatT: 0, tense: 0, bellT: 0, gustT: 0 };
 
 function newDuel() {
   duel = {
@@ -2321,6 +2526,13 @@ const STATES = {
     update(dt) {
       if (!duel.ready) return;
       duel.stareT += dt;
+      fx.bellT += dt; if (fx.bellT > 2.7) { fx.bellT = 0; Sfx.bell(); }
+      fx.gustT -= dt;
+      if (fx.gustT <= 0) {            // wind pushes low dust across the street
+        fx.gustT = rand(0.12, 0.3);
+        const d = Math.random() < 0.8 ? 1 : -1;
+        puff([-d * rand(2, 6), rand(0.1, 0.5), rand(4, 14)], { size: rand(0.25, 0.5), grow: 0.5, max: rand(1.6, 2.6), alpha: 0.13, v: [d * rand(1.2, 2.4), 0.12, rand(-0.2, 0.2)] });
+      }
       duel.tremor = Math.min(CONFIG.sway.max, CONFIG.sway.base + CONFIG.sway.growthPerSec * duel.stareT);
       if (duel.stareT >= duel.delay) setState('DRAW');
     },
@@ -2328,6 +2540,8 @@ const STATES = {
       if (duel.ready) return;
       duel.ready = true; duel.stareT = 0;
       duel.delay = rand(CONFIG.stare.minDelay, CONFIG.stare.maxDelay);
+      Sfx.bell(); fx.bellT = 0; fx.gustT = 0.3;
+      if (!weed.active) weed.next = Math.min(weed.next, rand(0.8, 2));
     },
     up() {
       if (!duel.ready) return;
@@ -2463,12 +2677,21 @@ function updateFx(dt, rdt) {
   fx.lb += ((state === 'INTRO' ? 0 : 1) - fx.lb) * k;
   fx.focusK += ((duel.focusing ? 1 : 0) - fx.focusK) * Math.min(1, rdt * 10);
   fx.honorShown += (store.honor / CONFIG.honor.max - fx.honorShown) * Math.min(1, rdt * 4);
+  // stare-down tension drives the cinematic panels, grade and letterbox
+  const staring = state === 'STARE' && duel.ready;
+  const tgt = staring ? clamp(duel.stareT / 3.5, 0, 1) : (state === 'DRAW' && !duel.outcome ? 0.55 : 0);
+  fx.tense += (tgt - fx.tense) * Math.min(1, rdt * (tgt > fx.tense ? 2.5 : 5));
+  const pa = staring && duel.stareT > 0.6 ? 1 : 0, pb = staring && duel.stareT > 1.4 ? 1 : 0;
+  fx.panelA += (pa - fx.panelA) * Math.min(1, rdt * (pa ? 5 : 16));
+  fx.panelB += (pb - fx.panelB) * Math.min(1, rdt * (pb ? 5 : 16));
+  fx.pulse = Math.max(0, fx.pulse - rdt * 3.2);
 
   // camera: slow push-in as tension rises, a punch-in on the winning shot
   let zt = 1;
   if (state === 'STARE' && duel.ready) zt = 1 + 0.035 * clamp(duel.stareT / CONFIG.stare.maxDelay, 0, 1);
   else if (state === 'DRAW') zt = 1.06;
   else if (state === 'RESULT') zt = duel.slowmoT > 0 && duel.outcome.won ? 1.2 : 1.05;
+  if (state === 'STARE' && duel.ready) zt = 1 + 0.07 * clamp(duel.stareT / CONFIG.stare.maxDelay, 0, 1) + 0.006 * fx.pulse;
   cam.zoom += (zt - cam.zoom) * Math.min(1, rdt * 5);
   cam.shake *= Math.exp(-rdt * 9);
   if (cam.shake < 0.05) cam.shake = 0;
@@ -2506,7 +2729,12 @@ function update(dt, rdt) {
   updateWeed(dt);
   updateFx(dt, rdt);
   updateRigs();
-  Sfx.update(audioParams());
+  const ap = audioParams();
+  if (ap.heart) {                    // heartbeat: sound and a visual pulse together
+    fx.beatT += rdt;
+    if (fx.beatT >= 60 / ap.bpm) { fx.beatT = 0; fx.pulse = 1; Sfx.heart(ap.heartVol); }
+  } else fx.beatT = 10;
+  Sfx.update(ap);
 }
 
 /* =====================================================================
@@ -2577,6 +2805,7 @@ function drawMenu(c) {
   ];
   const fs = Math.min(15 * S, W / 62), y0 = H * 0.55 + 66 * S + 34 * S;
   lines.forEach((l, i) => text(c, l, cx, y0 + i * fs * 1.6, fs, { weight: 400, color: i === 3 ? '#cdb68a' : '#eadcbc', stroke: INK }));
+  if (!ASSETS.ok) text(c, 'Running without the assets folder (built-in models). Serve the game over http for full detail.', cx, H - 16 * S, Math.min(12 * S, W / 70), { weight: 400, style: 'italic', color: '#b89a6a' });
 }
 
 function drawBanner(c) {
@@ -2612,12 +2841,27 @@ function drawBanner(c) {
   }
 }
 
+// frames around the stare-down's inset panels
+function drawPanelFrames(c) {
+  if (fx.panelA <= 0.02 && fx.panelB <= 0.02) return;
+  const pr = panelRects();
+  for (const [r, a] of [[pr.eyes, fx.panelA], [pr.hand, fx.panelB]]) {
+    if (a <= 0.02 || r.w < 3 || r.h < 3) continue;
+    const g = c.createLinearGradient(0, r.y, 0, r.y + r.h);
+    g.addColorStop(0, 'rgba(8,3,2,0.55)'); g.addColorStop(0.22, 'rgba(8,3,2,0)'); g.addColorStop(0.78, 'rgba(8,3,2,0)'); g.addColorStop(1, 'rgba(8,3,2,0.6)');
+    c.fillStyle = g; c.fillRect(r.x, r.y, r.w, r.h);
+    c.lineWidth = 5 * S; c.strokeStyle = 'rgba(6,3,2,0.95)'; c.strokeRect(r.x - 2.5 * S, r.y - 2.5 * S, r.w + 5 * S, r.h + 5 * S);
+    c.lineWidth = 1.5 * S; c.strokeStyle = `rgba(226,188,112,${0.85 * a})`; c.strokeRect(r.x - 0.75 * S, r.y - 0.75 * S, r.w + 1.5 * S, r.h + 1.5 * S);
+  }
+}
+
 function drawOverlay(c) {
+  drawPanelFrames(c);
   const cx = W / 2, hintY = H * (1 - CONFIG.fx.letterbox) - 20 * S;
   if (state === 'INTRO') { drawMenu(c); return; }
 
   if (state === 'STARE') {
-    const a = clamp(stateT / 0.5, 0, 1) * clamp((3.4 - stateT) / 0.6, 0, 1);
+    const a = clamp(stateT / 0.5, 0, 1) * clamp((3.4 - stateT) / 0.6, 0, 1) * (1 - fx.panelA);
     if (a > 0) {
       text(c, 'YOUR OPPONENT', cx, H * 0.125, 12 * S, { alpha: a * 0.9, spacing: 4 * S, weight: 400, color: '#f0dcb0', stroke: INK });
       text(c, duel.name, cx, H * 0.125 + 27 * S, 27 * S, { alpha: a, stroke: INK, color: '#ffe9bd' });
@@ -2718,7 +2962,7 @@ function drawPost(c) {
   if (fx.focusK > 0.01) { c.fillStyle = `rgba(24,14,4,${0.22 * fx.focusK})`; c.fillRect(0, 0, W, H); }
 
   const v = c.createRadialGradient(cx, cy, diag * (0.45 - 0.12 * fx.focusK), cx, cy, diag * 1.02);
-  v.addColorStop(0, 'rgba(10,4,2,0)'); v.addColorStop(1, `rgba(10,4,2,${0.62 + 0.25 * fx.focusK})`);
+  v.addColorStop(0, 'rgba(10,4,2,0)'); v.addColorStop(1, `rgba(10,4,2,${Math.min(0.97, 0.62 + 0.25 * fx.focusK + 0.2 * fx.tense + 0.14 * fx.pulse)})`);
   c.fillStyle = v; c.fillRect(0, 0, W, H);
 
   // red vignette: flashes on a hit, lingers while wounded, floods when you fall
@@ -2738,7 +2982,7 @@ function drawPost(c) {
   }
 
   if (fx.lb > 0.005) {
-    const bh = H * CONFIG.fx.letterbox * fx.lb;
+    const bh = H * CONFIG.fx.letterbox * fx.lb * (1 + 0.4 * fx.tense);
     c.fillStyle = '#060302'; c.fillRect(0, 0, W, bh); c.fillRect(0, H - bh, W, bh);
   }
   if (fx.fade > 0) { c.fillStyle = `rgba(4,2,1,${fx.fade})`; c.fillRect(0, 0, W, H); }
@@ -2762,10 +3006,10 @@ function rigidBones(xf) {
 function skinnedDraws() {
   const o = duel.opp, P1 = R.player.parts, O1 = R.opp.parts, list = [];
   const pick = (parts, names) => names.map(n => parts[n]);
-  list.push([R.player.mesh, playerRig.m, pick(P1, ['body', 'head', 'hat', 'belt', 'handL', playerGunInHand() ? 'gripR' : 'handR'])]);
-  const on = ['body', 'head', 'belt', 'handL', oppGunInHand() && !o.disarmed ? 'gripR' : 'handR'];
+  list.push([R.player.mesh, playerRig.m, pick(P1, ['body', 'head', 'hair', 'hat', 'belt', 'handL', playerGunInHand() ? 'gripR' : 'handR']), 'eye_brown']);
+  const on = ['body', 'head', 'hair', 'belt', 'handL', oppGunInHand() && !o.disarmed ? 'gripR' : 'handR'];
   if (!o.hatOff) on.push('hat');
-  list.push([R.opp.mesh, oppRig.m, pick(O1, on)]);
+  list.push([R.opp.mesh, oppRig.m, pick(O1, on), 'eye_blue']);
   const whole = [{ start: 0, count: GUN_MESH.count }];
   list.push([GUN_MESH, rigidBones(gunXf(playerRig, playerGunInHand(), R.player)), whole]);
   if (!o.disarmed || !oppGunInHand()) list.push([GUN_MESH, rigidBones(gunXf(oppRig, oppGunInHand(), R.opp)), whole]);
@@ -2776,24 +3020,35 @@ function skinnedDraws() {
   return list;
 }
 function drawSkinned(prog, list) {
-  for (const [mesh, bones, ranges] of list) {
+  for (const [mesh, bones, ranges, eye] of list) {
     gl.bindVertexArray(mesh.vao);
+    if (eye && ASSETS.tex[eye]) { gl.activeTexture(gl.TEXTURE0 + EYE_UNIT); gl.bindTexture(gl.TEXTURE_2D, ASSETS.tex[eye]); gl.activeTexture(gl.TEXTURE0); }
     gl.uniformMatrix4fv(prog.u('uBones'), false, bones);
     for (const r of ranges) gl.drawElements(gl.TRIANGLES, r.count, gl.UNSIGNED_INT, r.start * 4);
   }
 }
-function setLights(prog, vp, flash) {
+function setLights(prog, vp, flash, cam, expo) {
   gl.useProgram(prog.p);
   gl.uniformMatrix4fv(prog.u('uVP'), false, vp);
   gl.uniformMatrix4fv(prog.u('uLightVP'), false, R.lightVP);
   gl.uniform3fv(prog.u('uSunDir'), R.sun); gl.uniform3fv(prog.u('uSunCol'), LIGHT.sunCol);
   gl.uniform3fv(prog.u('uFillDir'), LIGHT.fillDir); gl.uniform3fv(prog.u('uFillCol'), LIGHT.fillCol);
   gl.uniform3fv(prog.u('uSkyAmb'), LIGHT.skyAmb); gl.uniform3fv(prog.u('uGndAmb'), LIGHT.gndAmb); gl.uniform3fv(prog.u('uGlowAmb'), LIGHT.glowAmb);
-  gl.uniform3f(prog.u('uCam'), 0, EYE, 0);
-  gl.uniform1f(prog.u('uExposure'), LIGHT.exposure); gl.uniform1f(prog.u('uFog'), LIGHT.fog);
+  gl.uniform3fv(prog.u('uCam'), cam);
+  gl.uniform1f(prog.u('uExposure'), LIGHT.exposure * expo); gl.uniform1f(prog.u('uFog'), LIGHT.fog);
   gl.uniform1f(prog.u('uTime'), rclock); gl.uniform1f(prog.u('uShadowTexel'), 1 / CONFIG.gfx.shadowRes);
   gl.uniform4fv(prog.u('uFlash'), flash); gl.uniform3f(prog.u('uFlashCol'), 1.0, 0.72, 0.38);
   gl.uniform1i(prog.u('uShadow'), 0); gl.uniform1i(prog.u('uAtlas'), 1);
+  TEX_UNITS.forEach((u, i) => gl.uniform1i(prog.u(u[0]), 2 + i));
+  gl.uniform1f(prog.u('uTexOn'), ASSETS.ok ? 1 : 0);
+}
+// sampler uniform -> texture file; units 2.. in this order
+const TEX_UNITS = [['uGround', 'ground_albedo'], ['uGroundN', 'ground_normal'], ['uWood', 'wood_albedo'], ['uWoodN', 'wood_normal'], ['uCloth', 'cloth_albedo'], ['uClothN', 'cloth_normal'],
+  ['uLeather', 'leather_albedo'], ['uLeatherN', 'leather_normal'], ['uEye', 'eye_brown'], ['uProp', 'lantern_baseColor'], ['uPropN', 'lantern_normal'], ['uPropE', 'lantern_emissive']];
+const EYE_UNIT = 2 + 8;
+function bindTextures() {
+  TEX_UNITS.forEach((u, i) => { gl.activeTexture(gl.TEXTURE2 + i); gl.bindTexture(gl.TEXTURE_2D, ASSETS.tex[u[1]] || ASSETS.blank); });
+  gl.activeTexture(gl.TEXTURE0);
 }
 
 function particleBuffer() {
@@ -2826,6 +3081,7 @@ function renderGL() {
   g.bindVertexArray(R.town.mesh.vao);
   g.drawElements(g.TRIANGLES, R.town.mesh.count - R.town.groundCount, g.UNSIGNED_INT, R.town.groundCount * 4);
   if (weed.active) { g.uniformMatrix4fv(R.depthS.u('uModel'), false, weedMatrix()); g.bindVertexArray(R.weed.vao); g.drawElements(g.TRIANGLES, R.weed.count, g.UNSIGNED_INT, 0); }
+  if (R.lantern) { g.bindVertexArray(R.lantern.mesh.vao); for (const m of R.lantern.at) { g.uniformMatrix4fv(R.depthS.u('uModel'), false, m); g.drawElements(g.TRIANGLES, R.lantern.mesh.count, g.UNSIGNED_INT, 0); } }
   g.useProgram(R.depthK.p);
   g.uniformMatrix4fv(R.depthK.u('uVP'), false, R.lightVP);
   drawSkinned(R.depthK, skinned);
@@ -2837,30 +3093,33 @@ function renderGL() {
   g.clear(g.DEPTH_BUFFER_BIT);
   g.activeTexture(g.TEXTURE0); g.bindTexture(g.TEXTURE_2D, R.shadowTex);
   g.activeTexture(g.TEXTURE1); g.bindTexture(g.TEXTURE_2D, R.atlas);
-
-  g.disable(g.DEPTH_TEST);
-  g.useProgram(R.sky.p);
-  const inv = affInv(camAffine());
-  g.uniform3f(R.sky.u('uRow0'), inv[0], inv[2], inv[4]); g.uniform3f(R.sky.u('uRow1'), inv[1], inv[3], inv[5]);
-  g.uniform4f(R.sky.u('uView'), view.vx, view.hy, view.f, H);
-  g.uniform1f(R.sky.u('uRS'), R.msaa.w / W); g.uniform1f(R.sky.u('uTime'), rclock);
-  g.uniform3fv(R.sky.u('uSunDir'), R.sun); g.uniform1f(R.sky.u('uExposure'), LIGHT.exposure);
-  g.bindVertexArray(R.emptyVao); g.drawArrays(g.TRIANGLES, 0, 3);
-  g.enable(g.DEPTH_TEST);
+  bindTextures();
 
   const o = duel.opp;
   let flash = [0, 0, 0, 0];
   if (fx.muzzle > 0) { const m = muzzleOf(gunXf(playerRig, true)); flash = [m[0], m[1], m[2], 6 * fx.muzzle / 0.07]; }
   else if (o.flashT > 0) { const m = muzzleOf(gunXf(oppRig, true)); flash = [m[0], m[1], m[2], 6 * o.flashT / 0.08]; }
-
-  setLights(R.scene, vp, flash);
-  g.uniform1f(R.scene.u('uTwoSided'), 1); g.uniformMatrix4fv(R.scene.u('uModel'), false, IDENT4);
-  g.bindVertexArray(R.town.mesh.vao); g.drawElements(g.TRIANGLES, R.town.mesh.count, g.UNSIGNED_INT, 0);
-  if (weed.active) { g.uniformMatrix4fv(R.scene.u('uModel'), false, weedMatrix()); g.bindVertexArray(R.weed.vao); g.drawElements(g.TRIANGLES, R.weed.count, g.UNSIGNED_INT, 0); }
-
-  setLights(R.skin, vp, flash);
-  g.uniform1f(R.skin.u('uTwoSided'), 0);
-  drawSkinned(R.skin, skinned);
+  // sky, town, props and characters for one camera
+  const drawWorld = (vp, cam, sky, expo) => {
+    g.disable(g.DEPTH_TEST);
+    g.useProgram(R.sky.p);
+    g.uniform3fv(R.sky.u('uRow0'), sky.row0); g.uniform3fv(R.sky.u('uRow1'), sky.row1);
+    g.uniform4fv(R.sky.u('uView'), sky.view); g.uniformMatrix3fv(R.sky.u('uCamR'), false, m3T(sky.R));
+    g.uniform1f(R.sky.u('uRS'), R.msaa.w / W); g.uniform1f(R.sky.u('uTime'), rclock);
+    g.uniform3fv(R.sky.u('uSunDir'), R.sun); g.uniform1f(R.sky.u('uExposure'), LIGHT.exposure * expo);
+    g.bindVertexArray(R.emptyVao); g.drawArrays(g.TRIANGLES, 0, 3);
+    g.enable(g.DEPTH_TEST);
+    setLights(R.scene, vp, flash, cam, expo);
+    g.uniform1f(R.scene.u('uTwoSided'), 1); g.uniformMatrix4fv(R.scene.u('uModel'), false, IDENT4);
+    g.bindVertexArray(R.town.mesh.vao); g.drawElements(g.TRIANGLES, R.town.mesh.count, g.UNSIGNED_INT, 0);
+    if (weed.active) { g.uniformMatrix4fv(R.scene.u('uModel'), false, weedMatrix()); g.bindVertexArray(R.weed.vao); g.drawElements(g.TRIANGLES, R.weed.count, g.UNSIGNED_INT, 0); }
+    if (R.lantern) { g.bindVertexArray(R.lantern.mesh.vao); for (const m of R.lantern.at) { g.uniformMatrix4fv(R.scene.u('uModel'), false, m); g.drawElements(g.TRIANGLES, R.lantern.mesh.count, g.UNSIGNED_INT, 0); } }
+    setLights(R.skin, vp, flash, cam, expo);
+    g.uniform1f(R.skin.u('uTwoSided'), 0);
+    drawSkinned(R.skin, skinned);
+  };
+  const inv = affInv(camAffine());
+  drawWorld(vp, [0, EYE, 0], { row0: [inv[0], inv[2], inv[4]], row1: [inv[1], inv[3], inv[5]], view: [view.vx, view.hy, view.f, H], R: I3 }, 1);
 
   const pb = particleBuffer();
   if (pb.count) {
@@ -2870,6 +3129,29 @@ function renderGL() {
     g.bufferData(g.ARRAY_BUFFER, pb.data, g.DYNAMIC_DRAW);
     g.drawArrays(g.TRIANGLES, 0, pb.count);
     g.disable(g.BLEND); g.depthMask(true);
+  }
+
+  // cinematic inset panels during the stare-down: his eyes, and his gun hand
+  if (fx.panelA > 0.02 || fx.panelB > 0.02) {
+    const pr = panelRects(), k = R.msaa.w / W, t = clamp(duel.stareT / CONFIG.stare.maxDelay, 0, 1), cams = [];
+    if (fx.panelA > 0.02) {
+      const T = xfPoint(oppRig.xf[BONE.head], vadd(R.opp.eyeMid, [0, 0.01, 0])), r = Object.assign({}, pr.eyes, { x: W / 2 - pr.eyes.full / 2, w: pr.eyes.full });
+      cams.push([panelCam(vadd(T, [0.03 * Math.sin(rclock * 0.7), 0.006 * Math.sin(rclock * 1.1), -0.62]), T, r, lerp(0.25, 0.17, t)), pr.eyes]);
+    }
+    if (fx.panelB > 0.02) {
+      const T = vadd(oppRig.J.handR, [0.04, -0.03, 0]), r = Object.assign({}, pr.hand, { y: H * 0.43, h: pr.hand.full });
+      cams.push([panelCam(vadd(T, [-0.12 + 0.02 * Math.sin(rclock * 0.6), 0.07, -0.85]), T, r, lerp(0.34, 0.27, t)), pr.hand]);
+    }
+    g.enable(g.SCISSOR_TEST);
+    for (const [c, vis] of cams) {
+      const r = c.rect;
+      g.viewport(Math.round(r.x * k), Math.round((H - r.y - r.h) * k), Math.round(r.w * k), Math.round(r.h * k));
+      g.scissor(Math.round(vis.x * k), Math.round((H - vis.y - vis.h) * k), Math.max(1, Math.round(vis.w * k)), Math.max(1, Math.round(vis.h * k)));
+      g.clear(g.DEPTH_BUFFER_BIT);
+      drawWorld(panelVP(c), c.pos, { row0: [1, 0, 0], row1: [0, 1, 0], view: [r.x + r.w / 2, r.y + r.h / 2, c.f, H], R: c.R }, 1.5);
+    }
+    g.disable(g.SCISSOR_TEST);
+    g.viewport(0, 0, R.msaa.w, R.msaa.h);
   }
 
   // 3. resolve, bloom, composite
@@ -2891,7 +3173,7 @@ function renderGL() {
   }
   pass(R.final, R.resolve, null, () => {
     g.activeTexture(g.TEXTURE2); g.bindTexture(g.TEXTURE_2D, A.tex); g.uniform1i(R.final.u('uBloom'), 2);
-    g.uniform1f(R.final.u('uBloomK'), CONFIG.gfx.bloom); g.activeTexture(g.TEXTURE0);
+    g.uniform1f(R.final.u('uBloomK'), CONFIG.gfx.bloom); g.uniform1f(R.final.u('uTense'), fx.tense); g.activeTexture(g.TEXTURE0);
   });
   g.bindVertexArray(null);
 }
@@ -2954,9 +3236,10 @@ makeGrain();
 // Building the models takes a moment, so it runs in steps with a message between each.
 const bootSteps = [
   ['Raising the town…', () => { if (!glInit()) throw new Error('WebGL2 is not available'); glResize(); R.town = buildTown(); R.weed = buildWeed(); }],
+  ['Unpacking the saddlebags…', () => loadAssets().then(buildLantern)],
   ['Forging the iron…', () => buildGun()],
-  ['Sculpting your opponent…', () => { R.opp = buildCharacter({ pal: PALETTES.opp, long: true, bandana: true, mustache: true, q: 1.45, belt: { rx: 0.188, rz: 0.15, slant: 0.02, cartridges: false } }); }],
-  ['Sculpting the gunslinger…', () => { R.player = buildCharacter({ pal: PALETTES.player, long: false, shirtSleeves: true, bandana: false, mustache: false, q: 0.875, belt: { rx: 0.192, rz: 0.146, slant: 0.03, cartridges: true } }); }],
+  ['Sculpting your opponent…', () => { R.opp = buildCharacter({ headFile: 'head_a', pal: PALETTES.opp, long: true, bandana: true, mustache: true, q: 1.45, belt: { rx: 0.188, rz: 0.15, slant: 0.02, cartridges: false } }); }],
+  ['Sculpting the gunslinger…', () => { R.player = buildCharacter({ headFile: 'head_b', pal: PALETTES.player, long: false, shirtSleeves: true, bandana: false, mustache: false, q: 0.875, belt: { rx: 0.192, rz: 0.146, slant: 0.03, cartridges: true } }); }],
 ];
 function bootNext(i) {
   if (i >= bootSteps.length) {
@@ -2967,13 +3250,11 @@ function bootNext(i) {
   }
   splash(bootSteps[i][0]);
   setTimeout(() => {
-    try { bootSteps[i][1](); } catch (e) {
+    new Promise(ok => ok(bootSteps[i][1]())).then(() => bootNext(i + 1), e => {
       R.failed = true;
       splash('This game needs WebGL2, which this browser could not start.', String(e && e.message || e));
       if (window.console) console.error(e);
-      return;
-    }
-    bootNext(i + 1);
+    });
   }, 30);
 }
 bootNext(0);
@@ -2981,7 +3262,7 @@ bootNext(0);
 // test hook: open duel.html#debug to inspect state from the console
 if (location.hash.indexOf('debug') >= 0) {
   window.__duel = {
-    CONFIG, store, LIGHT, R, DEBUG, OPP_XF, PLAYER_XF,
+    CONFIG, store, LIGHT, R, DEBUG, OPP_XF, PLAYER_XF, ASSETS,
     step(dt, noDraw) { clock += dt; rclock += dt; update(dt, dt); if (!noDraw) { render(); gl.finish(); } },
     get state() { return state; },
     get duel() { return duel; },
