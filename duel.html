@@ -1,0 +1,2996 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sundown Duel</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d0705; overflow: hidden; }
+  canvas { display: block; position: fixed; inset: 0; width: 100%; height: 100%; user-select: none; -webkit-user-select: none; }
+  #hud { cursor: none; touch-action: none; }
+</style>
+</head>
+<body>
+<canvas id="gl"></canvas>
+<canvas id="hud"></canvas>
+<script>
+(() => {
+'use strict';
+
+/* =====================================================================
+   1. CONFIG — every tuning knob lives here
+   ===================================================================== */
+const CONFIG = {
+  distance: 15,                       // metres between the duellists
+  camera: { eyeHeight: 1.62, focal: 1.3, horizon: 0.5, vanishX: 0.58 },
+
+  stare: {
+    minDelay: 2,                      // seconds before the opponent may move
+    maxDelay: 6,
+    graceRelease: 0.3,                // releasing this soon just cancels "ready"
+    forfeitWindow: 0.9,               // gun is out after an early release; a shot here is dishonorable
+  },
+
+  sway: {                             // reticle sway, in px at an 800px-tall view
+    base: 6,
+    growthPerSec: 3.5,                // hand tremor grows while the stare-down lasts
+    max: 28,
+    woundMult: 1.7,
+    jitter: 0.3,
+  },
+
+  focus: { swayMult: 0.14, drainPerSec: 0.42, regenPerSec: 0.08, minToEngage: 0.06 },
+
+  player: { ammo: 6, fireCooldown: 0.38, drawTime: 0.28, recoil: 44, wounds: 2 },
+
+  opponent: { hp: 3, twitchTime: 0.25, woundDelay: 0.55, woundAccMult: 0.6, accRampPerShot: 0.08 },
+
+  difficulty: {
+    greenhorn:  { label: 'Greenhorn',  blurb: 'Slow hand, shaky aim',   reaction: [1.15, 1.65], accuracy: 0.35, lethal: 0.35, refire: 1.05, honorMult: 1 },
+    gunslinger: { label: 'Gunslinger', blurb: 'Steady and dangerous',   reaction: [0.80, 1.10], accuracy: 0.60, lethal: 0.55, refire: 0.80, honorMult: 1.5 },
+    legend:     { label: 'Legend',     blurb: "Blink and you're dead",  reaction: [0.55, 0.75], accuracy: 0.85, lethal: 0.75, refire: 0.60, honorMult: 2 },
+  },
+
+  honor: { start: 50, min: 0, max: 100, cleanKill: 10, messyKill: 5, disarm: 14, dishonor: -25, forfeit: -2 },
+
+  fx: { slowmoScale: 0.16, slowmoTime: 1.9, bannerDelay: 0.7, shakeShot: 9, shakeHit: 20, letterbox: 0.07 },
+
+  // rendering: shadow map size, anti-aliasing samples, pixel budget, sun position (degrees), bloom strength,
+  // and model detail (1 = full; 1.5 builds coarser models faster on slow machines)
+  gfx: { shadowRes: 2048, msaa: 4, maxPixels: 3.4e6, sunAzimuth: 6, sunElevation: 11, bloom: 0.45, detail: 1 },
+
+  audio: { master: 0.7 },
+  storageKey: 'sundownDuel.v1',
+};
+
+/* =====================================================================
+   2. UTILITIES
+   ===================================================================== */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a, b) => a + Math.random() * (b - a);
+const smooth = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const easeOut = t => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+const easeOutBack = t => { t = clamp(t, 0, 1) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; };
+const mix = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+const mix2 = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t)];
+const shade = (c, k) => [c[0] * k, c[1] * k, c[2] * k];
+const rgb = (c, a) => a === undefined
+  ? `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`
+  : `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function distSeg(px, py, a, b) {
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const l2 = dx * dx + dy * dy;
+  const t = l2 ? clamp(((px - a[0]) * dx + (py - a[1]) * dy) / l2, 0, 1) : 0;
+  return Math.hypot(px - (a[0] + dx * t), py - (a[1] + dy * t));
+}
+
+// ---- 3D maths: vectors are [x,y,z]; 3x3 matrices are row-major arrays of 9 ----
+const vadd = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const vsub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const vmul = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const vdot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const vcross = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const vlen = a => Math.hypot(a[0], a[1], a[2]);
+const vnorm = a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+const vlerp = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+const I3 = [1, 0, 0, 0, 1, 0, 0, 0, 1];
+const m3mul = (A, B) => {
+  const o = new Array(9);
+  for (let r = 0; r < 3; r++) for (let c = 0; c < 3; c++) o[r * 3 + c] = A[r * 3] * B[c] + A[r * 3 + 1] * B[3 + c] + A[r * 3 + 2] * B[6 + c];
+  return o;
+};
+const m3v = (A, v) => [A[0] * v[0] + A[1] * v[1] + A[2] * v[2], A[3] * v[0] + A[4] * v[1] + A[5] * v[2], A[6] * v[0] + A[7] * v[1] + A[8] * v[2]];
+const m3T = A => [A[0], A[3], A[6], A[1], A[4], A[7], A[2], A[5], A[8]];
+const m3cols = (x, y, z) => [x[0], y[0], z[0], x[1], y[1], z[1], x[2], y[2], z[2]];
+function m3axis(a, ang) {                       // rotation about a unit axis
+  const c = Math.cos(ang), s = Math.sin(ang), t = 1 - c, x = a[0], y = a[1], z = a[2];
+  return [t * x * x + c, t * x * y - s * z, t * x * z + s * y, t * x * y + s * z, t * y * y + c, t * y * z - s * x, t * x * z - s * y, t * y * z + s * x, t * z * z + c];
+}
+function m3fromTo(a, b) {                        // shortest rotation taking unit a onto unit b
+  const c = vdot(a, b);
+  if (c < -0.9999) return m3axis(vnorm(vcross(a, Math.abs(a[0]) < 0.9 ? [1, 0, 0] : [0, 1, 0])), Math.PI);
+  const v = vcross(a, b), k = 1 / (1 + c);
+  return [v[0] * v[0] * k + c, v[0] * v[1] * k - v[2], v[0] * v[2] * k + v[1], v[1] * v[0] * k + v[2], v[1] * v[1] * k + c, v[1] * v[2] * k - v[0], v[2] * v[0] * k - v[1], v[2] * v[1] * k + v[0], v[2] * v[2] * k + c];
+}
+const rotX = a => { const c = Math.cos(a), s = Math.sin(a); return [1, 0, 0, 0, c, -s, 0, s, c]; };
+const rotY = a => { const c = Math.cos(a), s = Math.sin(a); return [c, 0, s, 0, 1, 0, -s, 0, c]; };
+const rotZ = a => { const c = Math.cos(a), s = Math.sin(a); return [c, -s, 0, s, c, 0, 0, 0, 1]; };
+// rigid transforms { R, t }
+const xfMul = (A, B) => ({ R: m3mul(A.R, B.R), t: vadd(m3v(A.R, B.t), A.t) });
+const xfPoint = (A, p) => vadd(m3v(A.R, p), A.t);
+function mat4RT(Rm, t, out, off) {               // write a column-major 4x4
+  out[off] = Rm[0]; out[off + 1] = Rm[3]; out[off + 2] = Rm[6]; out[off + 3] = 0;
+  out[off + 4] = Rm[1]; out[off + 5] = Rm[4]; out[off + 6] = Rm[7]; out[off + 7] = 0;
+  out[off + 8] = Rm[2]; out[off + 9] = Rm[5]; out[off + 10] = Rm[8]; out[off + 11] = 0;
+  out[off + 12] = t[0]; out[off + 13] = t[1]; out[off + 14] = t[2]; out[off + 15] = 1;
+}
+
+/* =====================================================================
+   3. PERSISTENCE — honor + win/loss tally in localStorage
+   ===================================================================== */
+const store = { honor: CONFIG.honor.start, wins: 0, losses: 0, diff: 'gunslinger' };
+
+function loadStore() {
+  try {
+    const o = JSON.parse(localStorage.getItem(CONFIG.storageKey) || 'null');
+    if (o && typeof o === 'object') {
+      if (Number.isFinite(o.honor)) store.honor = clamp(o.honor, CONFIG.honor.min, CONFIG.honor.max);
+      if (Number.isFinite(o.wins)) store.wins = Math.max(0, Math.floor(o.wins));
+      if (Number.isFinite(o.losses)) store.losses = Math.max(0, Math.floor(o.losses));
+      if (CONFIG.difficulty[o.diff]) store.diff = o.diff;
+    }
+  } catch (e) { /* storage unavailable or corrupt: play with defaults */ }
+}
+function saveStore() {
+  try { localStorage.setItem(CONFIG.storageKey, JSON.stringify(store)); } catch (e) { /* ignore */ }
+}
+
+function honorRank() {
+  const h = store.honor;
+  if (h < 20) return 'Scoundrel';
+  if (h < 40) return 'Drifter';
+  if (h < 60) return 'Stranger';
+  if (h < 80) return 'Straight Shooter';
+  return 'Legend of the Territory';
+}
+
+/* =====================================================================
+   4. AUDIO — everything synthesised with the Web Audio API.
+      The context is created on the first user gesture (autoplay policy).
+   ===================================================================== */
+const Sfx = (() => {
+  let ac = null, master = null, echoIn = null, noiseBuf = null;
+  let droneGain = null, droneLP = null, tremGain = null;
+  let muted = false, nextBeat = 0, nextPluck = 0, step = 0;
+  const NOTES = [146.83, 220.0, 174.61, 146.83, 130.81, 155.56, 146.83, 110.0];
+
+  function resume() {
+    if (ac && ac.state !== 'running' && ac.state !== 'closed') {
+      const p = ac.resume();
+      if (p && p.catch) p.catch(() => {});
+    }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!ac || ac.state === 'closed') return;
+    if (document.hidden) { const p = ac.suspend(); if (p && p.catch) p.catch(() => {}); }
+    else resume();
+  });
+
+  function init() {
+    if (ac) { resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      ac = new AC();
+      master = ac.createGain();
+      master.gain.value = muted ? 0 : CONFIG.audio.master;
+      const comp = ac.createDynamicsCompressor();
+      master.connect(comp); comp.connect(ac.destination);
+
+      // canyon echo bus
+      echoIn = ac.createGain();
+      const dl = ac.createDelay(1.0); dl.delayTime.value = 0.34;
+      const fb = ac.createGain(); fb.gain.value = 0.36;
+      const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1400;
+      echoIn.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(master);
+
+      // shared noise buffer
+      const len = Math.floor(ac.sampleRate * 2);
+      noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+
+      // wind bed
+      const wind = ac.createBufferSource(); wind.buffer = noiseBuf; wind.loop = true;
+      const wf = ac.createBiquadFilter(); wf.type = 'bandpass'; wf.frequency.value = 380; wf.Q.value = 0.7;
+      const wg = ac.createGain(); wg.gain.value = 0.05;
+      const lfo = ac.createOscillator(); lfo.frequency.value = 0.11;
+      const lg = ac.createGain(); lg.gain.value = 170;
+      lfo.connect(lg); lg.connect(wf.frequency);
+      wind.connect(wf); wf.connect(wg); wg.connect(master);
+      wind.start(); lfo.start();
+
+      // tension drone
+      droneLP = ac.createBiquadFilter(); droneLP.type = 'lowpass'; droneLP.frequency.value = 200; droneLP.Q.value = 2;
+      droneGain = ac.createGain(); droneGain.gain.value = 0;
+      [[73.42, 'sawtooth', 0.5], [73.9, 'sawtooth', 0.5], [36.71, 'sine', 0.9], [110.3, 'triangle', 0.25]].forEach(([f, type, v]) => {
+        const o = ac.createOscillator(); o.type = type; o.frequency.value = f;
+        const g = ac.createGain(); g.gain.value = v;
+        o.connect(g); g.connect(droneLP); o.start();
+      });
+      droneLP.connect(droneGain); droneGain.connect(master);
+
+      // tremolo "strings" (a tight dissonant cluster)
+      tremGain = ac.createGain(); tremGain.gain.value = 0;
+      const am = ac.createGain(); am.gain.value = 0.55;
+      const tl = ac.createOscillator(); tl.frequency.value = 7.3;
+      const tg = ac.createGain(); tg.gain.value = 0.45;
+      tl.connect(tg); tg.connect(am.gain); tl.start();
+      const sf = ac.createBiquadFilter(); sf.type = 'lowpass'; sf.frequency.value = 1800;
+      [[440, 'sawtooth'], [466.16, 'sawtooth'], [587.33, 'triangle']].forEach(([f, type]) => {
+        const o = ac.createOscillator(); o.type = type; o.frequency.value = f; o.detune.value = rand(-6, 6);
+        o.connect(sf); o.start();
+      });
+      sf.connect(am); am.connect(tremGain); tremGain.connect(master); tremGain.connect(echoIn);
+    } catch (e) {
+      ac = null;
+      return;
+    }
+    resume();
+  }
+
+  const ok = () => !!ac && ac.state === 'running';
+
+  function env(g, t, vol, attack, dur) {
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + Math.max(dur, attack + 0.01));
+  }
+  function out(g, echo) {
+    g.connect(master);
+    if (echo) { const s = ac.createGain(); s.gain.value = echo; g.connect(s); s.connect(echoIn); }
+  }
+  function tone(freq, type, t, dur, vol, o = {}) {
+    const osc = ac.createOscillator(); osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    if (o.to) osc.frequency.exponentialRampToValueAtTime(o.to, t + (o.glide || dur));
+    const g = ac.createGain(); env(g, t, vol, o.attack || 0.005, dur);
+    let node = osc;
+    if (o.lp) {
+      const f = ac.createBiquadFilter(); f.type = 'lowpass';
+      f.frequency.setValueAtTime(o.lp, t);
+      if (o.lpTo) f.frequency.exponentialRampToValueAtTime(o.lpTo, t + dur);
+      node.connect(f); node = f;
+    }
+    node.connect(g); out(g, o.echo);
+    osc.start(t); osc.stop(t + dur + 0.05);
+  }
+  function noise(t, dur, vol, type, f0, f1, o = {}) {
+    const src = ac.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = o.q || 0.7;
+    f.frequency.setValueAtTime(f0, t);
+    if (f1) f.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    const g = ac.createGain(); env(g, t, vol, o.attack || 0.002, dur);
+    src.connect(f); f.connect(g); out(g, o.echo);
+    src.start(t, Math.random() * 1.5); src.stop(t + dur + 0.05);
+  }
+  function pluck(f, t, vol) {
+    tone(f, 'sawtooth', t, 1.3, vol, { lp: 2400, lpTo: 260, attack: 0.004, echo: 0.35 });
+    tone(f * 2.003, 'triangle', t, 0.5, vol * 0.35, { attack: 0.003 });
+  }
+  function beat(t, vol) {
+    tone(64, 'sine', t, 0.17, 0.75 * vol, { to: 38, glide: 0.12 });
+    tone(128, 'triangle', t, 0.07, 0.14 * vol, { to: 70, lp: 400 });
+    tone(56, 'sine', t + 0.16, 0.15, 0.5 * vol, { to: 36, glide: 0.1 });
+  }
+
+  return {
+    init,
+    toggleMute() {
+      muted = !muted;
+      if (ac) master.gain.setTargetAtTime(muted ? 0 : CONFIG.audio.master, ac.currentTime, 0.02);
+      return muted;
+    },
+    isMuted: () => muted,
+    shot(far) {
+      if (!ok()) return;
+      const t = ac.currentTime + (far ? 0.045 : 0), v = far ? 0.55 : 1;
+      noise(t, 0.09, 0.9 * v, 'highpass', far ? 700 : 1200, 0);
+      noise(t, far ? 0.5 : 0.42, 0.95 * v, 'lowpass', far ? 1800 : 3200, 220, { echo: 0.6 });
+      tone(far ? 120 : 160, 'sine', t, 0.22, 0.9 * v, { to: 42, glide: 0.14 });
+    },
+    whiz() { if (ok()) noise(ac.currentTime, 0.22, 0.35, 'bandpass', 3800, 700, { q: 6 }); },
+    thud(heavy) {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      tone(heavy ? 95 : 130, 'sine', t, heavy ? 0.3 : 0.16, heavy ? 0.8 : 0.45, { to: 40 });
+      noise(t, 0.08, 0.3, 'lowpass', 700, 200);
+    },
+    dry() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      tone(1900, 'square', t, 0.03, 0.12);
+      noise(t, 0.025, 0.2, 'highpass', 3000, 0);
+    },
+    cock() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      noise(t, 0.03, 0.25, 'highpass', 2500, 0);
+      tone(1300, 'square', t + 0.05, 0.025, 0.1);
+      noise(t + 0.05, 0.03, 0.22, 'bandpass', 4200, 0, { q: 3 });
+    },
+    sting() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      [146.83, 155.56, 220, 293.66].forEach(f => tone(f, 'sawtooth', t, 0.9, 0.16, { lp: 2600, lpTo: 300, attack: 0.008, echo: 0.4 }));
+      noise(t, 0.25, 0.18, 'highpass', 5000, 0);
+      tone(73.4, 'sine', t, 0.8, 0.5, { to: 55 });
+    },
+    slowmo() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      tone(220, 'sine', t, 1.4, 0.18, { to: 40, glide: 1.3 });
+      noise(t, 1.2, 0.12, 'lowpass', 1200, 120);
+    },
+    win() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      [146.83, 220, 293.66, 369.99, 440].forEach((f, i) => pluck(f, t + i * 0.07, 0.16));
+    },
+    lose() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      [146.83, 138.59, 116.54, 98].forEach((f, i) => tone(f, 'triangle', t + i * 0.32, 0.9, 0.2, { lp: 900, echo: 0.3 }));
+      tone(49, 'sine', t + 1.0, 1.6, 0.4);
+    },
+    // called every frame with the current musical state
+    update(p) {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      droneGain.gain.setTargetAtTime(p.music * (0.05 + 0.13 * p.tension), t, 0.3);
+      droneLP.frequency.setTargetAtTime(180 + 700 * p.tension, t, 0.3);
+      tremGain.gain.setTargetAtTime(p.music * 0.05 * Math.pow(p.tension, 1.5), t, 0.3);
+      if (p.heart) {
+        if (nextBeat < t - 0.1) nextBeat = t + 0.03;
+        if (t >= nextBeat - 0.05) { beat(Math.max(t, nextBeat), p.heartVol); nextBeat += 60 / p.bpm; }
+      }
+      if (p.pluck) {
+        if (nextPluck < t - 0.5) nextPluck = t + 0.5;
+        if (t >= nextPluck - 0.05) {
+          pluck(NOTES[step++ % NOTES.length], Math.max(t, nextPluck), 0.1);
+          nextPluck += p.pluckGap * rand(0.8, 1.3);
+        }
+      }
+    },
+  };
+})();
+
+/* =====================================================================
+   5. VIEW & CAMERA
+      The camera sits at (0, eye, 0) looking down +z. World: x = across the
+      street, y = up, z = depth. Zoom, shake and the death roll are a 2D
+      transform applied after projection, so aiming maths stays simple.
+   ===================================================================== */
+const hud = document.getElementById('hud');
+const ctx = hud.getContext('2d');
+const glCanvas = document.getElementById('gl');
+const HAS_LS = 'letterSpacing' in ctx;
+const SERIF = '"Rockwell","Rockwell Extra Bold","Clarendon","Bookman Old Style","Georgia","Times New Roman",serif';
+
+let W = 0, H = 0, DPR = 1, RS = 1, U = 1, S = 1;   // RS: render scale, U: px unit (H/800), S: UI scale
+const view = { vx: 0, hy: 0, f: 0 };
+const EYE = CONFIG.camera.eyeHeight;
+const NEAR = 0.25, FAR = 900;
+const STREET_HALF = 5.6;                 // metres from street centre to the building fronts
+const PLAYER_POS = [-0.6, 0, 2.4];       // where the player stands, in front of the camera
+const OPP_POS = [0, 0, CONFIG.distance];
+
+// world (metres) -> un-zoomed screen px
+function P(x, y, z) {
+  const s = view.f / z;
+  return [view.vx + x * s, view.hy - (y - EYE) * s, s];
+}
+
+const cam = { zoom: 1, shx: 0, shy: 0, shake: 0 };
+const zoomCenter = () => [view.vx, view.hy + H * 0.05];
+
+// 2D affine [a,b,c,d,e,f] (x' = a x + c y + e, y' = b x + d y + f): un-zoomed px -> final screen px
+function camAffine() {
+  const [cx, cy] = zoomCenter(), z = cam.zoom;
+  let m = [z, 0, 0, z, cx + cam.shx - cx * z, cy + cam.shy - cy * z];
+  const dk = duel ? smooth(duel.deathT) : 0;
+  if (dk > 0) {                          // the camera goes down with you
+    const a = dk * 0.2, s = 1 + dk * 0.35, co = Math.cos(a) * s, si = Math.sin(a) * s;
+    const tx = -W / 2, ty = -H / 2 + dk * H * 0.1;
+    const D = [co, si, -si, co, co * tx - si * ty + W / 2, si * tx + co * ty + H / 2];
+    m = [D[0] * m[0] + D[2] * m[1], D[1] * m[0] + D[3] * m[1], D[0] * m[2] + D[2] * m[3], D[1] * m[2] + D[3] * m[3],
+      D[0] * m[4] + D[2] * m[5] + D[4], D[1] * m[4] + D[3] * m[5] + D[5]];
+  }
+  return m;
+}
+function affInv(m) {
+  const det = m[0] * m[3] - m[2] * m[1];
+  const a = m[3] / det, b = -m[1] / det, c = -m[2] / det, d = m[0] / det;
+  return [a, b, c, d, -(a * m[4] + c * m[5]), -(b * m[4] + d * m[5])];
+}
+function screenToWorld(x, y) {
+  const i = affInv(camAffine());
+  return { x: i[0] * x + i[2] * y + i[4], y: i[1] * x + i[3] * y + i[5] };
+}
+function worldToScreen(x, y) {
+  const m = camAffine();
+  return { x: m[0] * x + m[2] * y + m[4], y: m[1] * x + m[3] * y + m[5] };
+}
+// the ray a bullet follows when fired at screen position (sx, sy)
+function aimRay(sx, sy) {
+  const w = screenToWorld(sx, sy);
+  return { o: [0, EYE, 0], d: vnorm([(w.x - view.vx) / view.f, -(w.y - view.hy) / view.f, 1]) };
+}
+function projectWorld(p) {
+  const q = P(p[0], p[1], Math.max(0.05, p[2]));
+  return worldToScreen(q[0], q[1]);
+}
+
+// world -> clip matrix that reproduces P() and camAffine() exactly
+function viewProj() {
+  const f = view.f, A = (FAR + NEAR) / (FAR - NEAR), B = -2 * FAR * NEAR / (FAR - NEAR);
+  const r0 = [2 * f / W, 0, 2 * view.vx / W - 1, 0];
+  const r1 = [0, 2 * f / H, 1 - 2 * view.hy / H, -2 * f / H * EYE];
+  const r3 = [0, 0, 1, 0];
+  const m = camAffine(), hw = H / W, wh = W / H;
+  const k0 = m[0] + m[2] * hw + 2 * m[4] / W - 1, k1 = 1 - m[1] * wh - m[3] - 2 * m[5] / H;
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    o[c * 4] = m[0] * r0[c] - m[2] * hw * r1[c] + k0 * r3[c];
+    o[c * 4 + 1] = -m[1] * wh * r0[c] + m[3] * r1[c] + k1 * r3[c];
+    o[c * 4 + 2] = c === 2 ? A : (c === 3 ? B : 0);
+    o[c * 4 + 3] = r3[c];
+  }
+  return o;
+}
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.max(320, window.innerWidth);
+  H = Math.max(240, window.innerHeight);
+  hud.width = Math.round(W * DPR);
+  hud.height = Math.round(H * DPR);
+  U = H / 800;
+  S = clamp(Math.min(W / 1100, H / 760), 0.45, 1.5);
+  view.vx = W * CONFIG.camera.vanishX;
+  view.hy = H * CONFIG.camera.horizon;
+  view.f = CONFIG.camera.focal * H;
+  input.x = clamp(input.x, 0, W);
+  input.y = clamp(input.y, 0, H);
+  RS = Math.min(DPR, Math.sqrt(CONFIG.gfx.maxPixels / (W * H)));
+  if (R.ok) glResize();
+  initMotes();
+}
+
+/* =====================================================================
+   6. WEBGL CORE — context, shaders, render targets
+   ===================================================================== */
+let gl = null;
+const R = { ok: false };
+
+const GLSL_COMMON = `
+uniform vec3 uSunDir;
+uniform float uExposure;
+float hash21(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+float hash31(vec3 p){ p=fract(p*vec3(.1031,.1030,.0973)); p+=dot(p,p.yxz+33.33); return fract((p.x+p.y)*p.z); }
+float vnoise(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  return mix(mix(hash21(i),hash21(i+vec2(1,0)),f.x), mix(hash21(i+vec2(0,1)),hash21(i+vec2(1,1)),f.x), f.y); }
+float vnoise3(vec3 p){ vec3 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  float a=mix(mix(hash31(i),hash31(i+vec3(1,0,0)),f.x), mix(hash31(i+vec3(0,1,0)),hash31(i+vec3(1,1,0)),f.x), f.y);
+  float b=mix(mix(hash31(i+vec3(0,0,1)),hash31(i+vec3(1,0,1)),f.x), mix(hash31(i+vec3(0,1,1)),hash31(i+vec3(1,1,1)),f.x), f.y);
+  return mix(a,b,f.z); }
+float fbm(vec2 p){ float a=.5, s=0.; for(int i=0;i<4;i++){ s+=a*vnoise(p); p=p*2.03+17.1; a*=.5; } return s; }
+// golden-hour sky gradient with the sun's glow, no clouds or disc
+vec3 skyBase(vec3 d){
+  float e=clamp(d.y,0.,1.);
+  float sa=max(dot(normalize(uSunDir.xz), normalize(d.xz+vec2(1e-5))),0.);
+  vec3 zen=vec3(0.045,0.065,0.19), mid=vec3(0.36,0.19,0.29);
+  vec3 hor=mix(vec3(0.62,0.27,0.16), vec3(1.05,0.60,0.28), pow(sa,4.));
+  float t=pow(clamp(e*2.6,0.,1.),0.65);
+  vec3 c=mix(hor,mid,smoothstep(0.,.6,t)); c=mix(c,zen,smoothstep(.5,1.,t));
+  float sd=max(dot(d,uSunDir),0.);
+  c+=vec3(1.8,1.0,0.45)*pow(sd,90.)*0.5+vec3(1.2,0.55,0.22)*pow(sd,10.)*0.14;
+  return c;
+}
+vec3 tonemap(vec3 x){
+  x*=uExposure;
+  x=clamp((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14),0.,1.);
+  return pow(x,vec3(1./2.2));
+}`;
+
+const VS_STATIC = `#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNor; layout(location=2) in vec4 aCol;
+layout(location=3) in vec4 aMat; layout(location=4) in vec2 aUv;
+uniform mat4 uVP, uModel;
+out vec3 vP; out vec3 vN; out vec3 vObj; out vec4 vCol; out vec4 vMat; out vec2 vUv;
+void main(){ vec4 w=uModel*vec4(aPos,1.); vP=w.xyz; vObj=aPos; vN=mat3(uModel)*aNor; vCol=aCol; vMat=aMat; vUv=aUv; gl_Position=uVP*w; }`;
+
+const VS_SKIN = `#version 300 es
+layout(location=0) in vec3 aPos; layout(location=1) in vec3 aNor; layout(location=2) in vec4 aCol;
+layout(location=3) in vec4 aMat; layout(location=4) in vec4 aBone; layout(location=5) in vec4 aWgt;
+uniform mat4 uVP; uniform mat4 uBones[16];
+out vec3 vP; out vec3 vN; out vec3 vObj; out vec4 vCol; out vec4 vMat; out vec2 vUv;
+void main(){
+  mat4 sk=uBones[int(aBone.x)]*aWgt.x+uBones[int(aBone.y)]*aWgt.y+uBones[int(aBone.z)]*aWgt.z+uBones[int(aBone.w)]*aWgt.w;
+  vec4 w=sk*vec4(aPos,1.); vP=w.xyz; vObj=aPos; vN=mat3(sk)*aNor; vCol=aCol; vMat=aMat; vUv=vec2(0.); gl_Position=uVP*w; }`;
+
+const VS_DEPTH_STATIC = `#version 300 es
+layout(location=0) in vec3 aPos; uniform mat4 uVP, uModel;
+void main(){ gl_Position=uVP*(uModel*vec4(aPos,1.)); }`;
+const VS_DEPTH_SKIN = `#version 300 es
+layout(location=0) in vec3 aPos; layout(location=4) in vec4 aBone; layout(location=5) in vec4 aWgt;
+uniform mat4 uVP; uniform mat4 uBones[16];
+void main(){
+  mat4 sk=uBones[int(aBone.x)]*aWgt.x+uBones[int(aBone.y)]*aWgt.y+uBones[int(aBone.z)]*aWgt.z+uBones[int(aBone.w)]*aWgt.w;
+  gl_Position=uVP*(sk*vec4(aPos,1.)); }`;
+const FS_DEPTH = `#version 300 es
+precision mediump float; void main(){}`;
+
+// One fragment shader lights everything: sun with soft shadows, fill, sky/ground ambient,
+// reflections, haze. "Patterns" add procedural surface detail (planks, dirt, cloth...).
+const FS_SCENE = `#version 300 es
+precision highp float; precision highp sampler2DShadow;
+${GLSL_COMMON}
+in vec3 vP; in vec3 vN; in vec3 vObj; in vec4 vCol; in vec4 vMat; in vec2 vUv;
+uniform vec3 uCam, uSunCol, uFillDir, uFillCol, uSkyAmb, uGndAmb, uGlowAmb, uFlashCol;
+uniform mat4 uLightVP; uniform sampler2DShadow uShadow; uniform sampler2D uAtlas;
+uniform vec4 uFlash; uniform float uTwoSided, uShadowTexel, uTime, uFog;
+out vec4 o;
+
+float shadowAt(vec3 p, vec3 n){
+  vec4 lp=uLightVP*vec4(p+n*0.03,1.); vec3 s=lp.xyz*0.5+0.5;
+  if(s.x<0.||s.x>1.||s.y<0.||s.y>1.||s.z>1.) return 1.;
+  float sum=0.;
+  for(int i=-1;i<=1;i++) for(int j=-1;j<=1;j++)
+    sum+=texture(uShadow, vec3(s.xy+vec2(float(i),float(j))*uShadowTexel*1.3, s.z-0.00035));
+  return sum/9.;
+}
+vec3 brdf(vec3 N, vec3 V, vec3 L, vec3 alb, float rough, float metal){
+  float nl=dot(N,L), dl=max((nl+0.15)/1.15,0.); nl=max(nl,0.);
+  vec3 Hh=normalize(V+L); float nh=max(dot(N,Hh),0.), vh=max(dot(V,Hh),0.), nv=max(dot(N,V),1e-3);
+  float a=max(rough*rough,0.02), a2=a*a, dd=nh*nh*(a2-1.)+1.; float D=a2/(dd*dd);
+  float k=(rough+1.); k=k*k/8.; float G=(nl/(nl*(1.-k)+k))*(nv/(nv*(1.-k)+k));
+  vec3 F0=mix(vec3(.04),alb,metal); vec3 F=F0+(1.-F0)*pow(1.-vh,5.);
+  return alb*(1.-metal)*dl + min(D*G/(4.*nv+1e-3),12.)*F;
+}
+float rutf(vec2 g){
+  float r=0.;
+  r+=exp(-pow((g.x+1.05-0.10*sin(g.y*0.21+1.))/0.11,2.));
+  r+=exp(-pow((g.x+0.15-0.08*sin(g.y*0.17+4.))/0.11,2.));
+  r+=exp(-pow((g.x-0.60-0.10*sin(g.y*0.19+2.))/0.11,2.));
+  r+=exp(-pow((g.x-1.45-0.09*sin(g.y*0.23+5.))/0.11,2.));
+  return clamp(r,0.,1.);
+}
+float groundH(vec2 g){ return vnoise(g*2.7)*0.55+vnoise(g*9.)*0.28+vnoise(g*31.)*0.12-rutf(g)*0.5; }
+
+void main(){
+  vec3 N=normalize(vN), V=normalize(uCam-vP);
+  if(uTwoSided>.5 && dot(N,V)<0.) N=-N;
+  vec3 alb=vCol.rgb; float ao=vCol.a, rough=vMat.x, metal=vMat.y, emis=vMat.w; int pat=int(vMat.z+.5);
+  vec3 emit=vec3(0.); float fuzz=0.25;
+  if(pat==1){                 // horizontal clapboard siding (uv in metres)
+    float pv=vUv.y/0.17, pi=floor(pv), pf=fract(pv);
+    float brd=hash21(vec2(pi, floor(vUv.x/2.7+hash21(vec2(pi,3.))*5.)));
+    float grain=fbm(vec2(vUv.x*3., vUv.y*46.)+pi*7.3);
+    alb*=(0.74+0.42*brd)*(0.78+0.44*grain);
+    float gr=smoothstep(0.,.1,pf)*smoothstep(1.,.93,pf);
+    alb*=0.4+0.6*gr; ao*=0.7+0.3*gr;
+    if(abs(N.y)<0.7) N=normalize(N+vec3(0.,1.,0.)*(0.5-pf)*0.3);
+    alb*=mix(0.7,1.0,smoothstep(0.2,1.8,vUv.y));
+  } else if(pat==6){          // vertical boards
+    float pv=vUv.x/0.21, pi=floor(pv), pf=fract(pv);
+    float brd=hash21(vec2(pi,11.));
+    float grain=fbm(vec2(vUv.x*46., vUv.y*3.)+pi*5.1);
+    alb*=(0.76+0.4*brd)*(0.78+0.44*grain);
+    float gr=smoothstep(0.,.08,pf)*smoothstep(1.,.92,pf);
+    alb*=0.4+0.6*gr; ao*=0.7+0.3*gr;
+  } else if(pat==2){          // floor planks, boards spaced along v
+    float pv=vUv.y/0.2, pi=floor(pv), pf=fract(pv);
+    float brd=hash21(vec2(pi,23.));
+    float grain=fbm(vec2(vUv.x*3., vUv.y*40.)+pi*3.3);
+    alb*=(0.72+0.45*brd)*(0.75+0.5*grain);
+    float gr=smoothstep(0.,.07,pf)*smoothstep(1.,.93,pf);
+    alb*=0.35+0.65*gr; ao*=0.7+0.3*gr;
+  } else if(pat==3){          // packed dirt street
+    vec2 g=vP.xz; float e=0.035;
+    float h0=groundH(g), hx=groundH(g+vec2(e,0.)), hz=groundH(g+vec2(0.,e));
+    N=normalize(vec3(-(hx-h0)/e*0.05, 1., -(hz-h0)/e*0.05));
+    float n1=fbm(g*0.3), n2=fbm(g*2.1+5.);
+    alb=mix(vec3(0.23,0.125,0.065), vec3(0.44,0.275,0.15), n1)*(0.72+0.56*n2);
+    alb*=1.-0.38*rutf(g);
+    vec2 cg=g*8., ci=floor(cg), cf=fract(cg); float pr=hash21(ci);
+    vec2 pc=vec2(hash21(ci+3.1),hash21(ci+7.7))*0.6+0.2;
+    float peb=step(0.84,pr)*smoothstep(0.17,0.09,length(cf-pc));
+    alb=mix(alb, vec3(0.30,0.25,0.21)*(0.5+hash21(ci+1.3)), peb);
+    ao*=0.75+0.25*smoothstep(-0.3,0.4,h0);
+    rough=0.92;
+  } else if(pat==4){          // window glass: lamplit or dark and reflective
+    if(emis>0.5){
+      float cur=smoothstep(0.16,0.34,abs(vUv.x-0.5));
+      float flick=0.92+0.08*sin(uTime*9.+vP.z*3.)*sin(uTime*3.7+vP.z);
+      emit=mix(vec3(1.25,0.62,0.2), vec3(0.6,0.22,0.07), cur)*(1.25-0.5*vUv.y)*flick*emis;
+      alb=vec3(0.02); rough=0.25;
+    } else { alb=vec3(0.012,0.014,0.018); rough=0.07; }
+  } else if(pat==5){          // painted sign from the text atlas
+    alb=pow(texture(uAtlas,vUv).rgb,vec3(2.2)); rough=0.8;
+  } else if(pat==7 || pat==8){ // cloth / felt (7), leather and wood (8)
+    float fq=pat==7?130.:210., amp=pat==7?0.13:0.1;
+    vec3 q=vObj*fq; q=vec3(q.x*0.8+q.z*0.6, q.y+q.x*0.31, q.z*0.8-q.x*0.6);
+    vec3 q2=vec3(q.y*0.7-q.z*0.71, q.x*1.9, q.y*0.71+q.z*0.7)*2.3+7.;
+    float n0=vnoise3(q)*0.6+vnoise3(q2)*0.4;
+    alb*=1.-amp+amp*2.*n0;
+    float e=0.4;
+    vec3 gn=vec3(vnoise3(q+vec3(e,0,0)),vnoise3(q+vec3(0,e,0)),vnoise3(q+vec3(0,0,e)))-vnoise3(q);
+    N=normalize(N-gn*amp*1.6);
+    fuzz=pat==7?0.5:0.25;
+  }
+
+  float nv=max(dot(N,V),1e-3);
+  float sh=shadowAt(vP,normalize(vN)*(dot(normalize(vN),V)<0.&&uTwoSided>.5?-1.:1.));
+  vec3 col=brdf(N,V,uSunDir,alb,rough,metal)*uSunCol*sh;
+  col+=brdf(N,V,uFillDir,alb,rough,metal)*uFillCol*(0.35+0.65*ao);
+  vec3 amb=mix(uGndAmb,uSkyAmb,N.y*0.5+0.5);
+  float glow=max(dot(N,normalize(vec3(uSunDir.x,0.25,uSunDir.z))),0.);
+  amb+=uGlowAmb*glow*glow;
+  col+=alb*(1.-metal)*amb*ao;
+  vec3 Rv=reflect(-V,N);
+  vec3 env=skyBase(normalize(vec3(Rv.x,abs(Rv.y)*0.8+0.04,Rv.z)))*(Rv.y<0.?0.3:1.);
+  vec3 F0=mix(vec3(.04),alb,metal);
+  vec3 Fr=F0+(max(vec3(1.-rough),F0)-F0)*pow(1.-nv,5.);
+  col+=env*Fr*ao*(1.-rough*0.7);
+  // light scattering through fuzz and dust at grazing angles, toward the sun
+  float rim=pow(1.-nv,3.)*pow(max(dot(-V,uSunDir),0.),2.);
+  col+=uSunCol*(alb+0.04)*rim*fuzz*0.9*sh*(1.-metal);
+  if(uFlash.w>0.){ vec3 fl=uFlash.xyz-vP; float d2=dot(fl,fl);
+    col+=(alb*(1.-metal)+F0*0.5)*uFlashCol*uFlash.w*max(dot(N,normalize(fl))*0.8+0.2,0.)/(1.+d2*1.2); }
+  col+=emit;
+  float dist=length(uCam-vP);
+  float fog=1.-exp(-dist*uFog*exp(-max(vP.y,0.)*0.035));
+  vec3 fc=skyBase(normalize(vec3(-V.x,0.03,-V.z)))*0.42;
+  col=mix(col,fc,fog);
+  o=vec4(tonemap(col),1.);
+}`;
+
+const VS_FULL = `#version 300 es
+out vec2 vUv;
+void main(){ vec2 p=vec2(float((gl_VertexID<<1)&2), float(gl_VertexID&2)); vUv=p; gl_Position=vec4(p*2.-1.,1.,1.); }`;
+
+const FS_SKY = `#version 300 es
+precision highp float;
+${GLSL_COMMON}
+in vec2 vUv; uniform vec3 uRow0, uRow1; uniform vec4 uView; uniform float uRS, uTime;
+out vec4 o;
+void main(){
+  vec2 px=vec2(gl_FragCoord.x/uRS, uView.w-gl_FragCoord.y/uRS);
+  vec2 w=vec2(dot(uRow0,vec3(px,1.)), dot(uRow1,vec3(px,1.)));
+  vec3 d=normalize(vec3((w.x-uView.x)/uView.z, -(w.y-uView.y)/uView.z, 1.));
+  vec3 c=skyBase(d);
+  float sd=max(dot(d,uSunDir),0.);
+  if(d.y>0.004){               // streaky clouds, lit from below by the low sun
+    vec2 uv=d.xz/(d.y+0.09);
+    float n=fbm(vec2(uv.x*0.45+uTime*0.004, uv.y*1.5)+3.7);
+    float n2=fbm(vec2(uv.x*1.2+uTime*0.006, uv.y*3.9)+11.);
+    float cl=smoothstep(0.50,0.74,n*0.72+n2*0.38)*smoothstep(0.012,0.09,d.y)*(1.-smoothstep(0.45,0.85,d.y));
+    vec3 lit=mix(vec3(1.0,0.38,0.22), vec3(1.45,0.85,0.4), pow(sd,3.));
+    vec3 cc=mix(vec3(0.20,0.11,0.19), lit, smoothstep(0.40,0.78,n2)*0.85+0.08);
+    c=mix(c,cc,cl*0.88);
+  }
+  c+=vec3(6.,4.4,2.3)*smoothstep(0.99964,0.99975,sd);
+  // distant mesas on the horizon, fading into the haze
+  float az=atan(d.x,d.z);
+  vec3 haze=skyBase(normalize(vec3(d.x,0.,d.z)));
+  float h1=0.010+0.042*smoothstep(.42,.50,vnoise(vec2(az*5.+2.,1.)))+0.018*smoothstep(.50,.56,vnoise(vec2(az*13.,7.)))+0.004*vnoise(vec2(az*90.,3.));
+  float h2=0.004+0.022*smoothstep(.45,.52,vnoise(vec2(az*8.+40.,5.)))+0.003*vnoise(vec2(az*140.,9.));
+  if(d.y<h1){ float st=0.75+0.35*vnoise(vec2(az*40.,d.y*520.)); c=mix(vec3(0.40,0.17,0.13)*st, haze, 0.66); }
+  if(d.y<h2){ c=mix(vec3(0.24,0.10,0.09), haze, 0.5); }
+  if(d.y<0.) c=haze*0.7;
+  o=vec4(tonemap(c),1.);
+}`;
+
+const VS_PART = `#version 300 es
+layout(location=0) in vec3 aC; layout(location=1) in vec2 aQ; layout(location=2) in vec4 aCol; layout(location=3) in vec3 aPar;
+uniform mat4 uVP; out vec2 vQ; out vec4 vCol; out vec3 vPar;
+void main(){ vQ=aQ; vCol=aCol; vPar=aPar; gl_Position=uVP*vec4(aC+vec3(aQ*aPar.x,0.),1.); }`;
+const FS_PART = `#version 300 es
+precision highp float;
+in vec2 vQ; in vec4 vCol; in vec3 vPar; out vec4 o;
+float h21(vec2 p){ p=fract(p*vec2(123.34,456.21)); p+=dot(p,p+45.32); return fract(p.x*p.y); }
+float vn(vec2 p){ vec2 i=floor(p), f=fract(p); f=f*f*(3.-2.*f);
+  return mix(mix(h21(i),h21(i+vec2(1,0)),f.x), mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),f.x), f.y); }
+void main(){
+  float r=length(vQ); if(r>1.) discard;
+  int k=int(vPar.y+.5);
+  if(k==0){                    // soft dust / smoke puff
+    float a=pow(1.-r,1.4)*vCol.a*(0.55+0.9*vn(vQ*2.6+vPar.z*10.));
+    o=vec4(vCol.rgb*a,a);
+  } else if(k==1){             // muzzle flash (additive)
+    float ang=atan(vQ.y,vQ.x);
+    float sp=pow(abs(cos(ang*3.5+vPar.z*6.)),10.)*(0.55+0.45*sin(ang*3.+vPar.z*9.));
+    float i=(exp(-r*r*20.)*1.8+sp*pow(1.-r,2.)*1.3+exp(-r*r*4.5)*0.35)*vCol.a;
+    o=vec4(vCol.rgb*i,0.);
+  } else {                     // hard droplet
+    float a=smoothstep(1.,0.6,r)*vCol.a; o=vec4(vCol.rgb*a,a);
+  }
+}`;
+
+const FS_BRIGHT = `#version 300 es
+precision highp float; in vec2 vUv; uniform sampler2D uTex; uniform vec2 uTexel; out vec4 o;
+void main(){
+  vec3 c=vec3(0.);
+  for(int i=0;i<4;i++){ vec2 of=vec2(float(i&1)*2.-1., float(i>>1)*2.-1.)*uTexel;
+    vec3 s=texture(uTex,vUv+of).rgb; float l=max(s.r,max(s.g,s.b)); c+=s*smoothstep(0.86,1.0,l); }
+  o=vec4(c*0.25,1.);
+}`;
+const FS_BLUR = `#version 300 es
+precision highp float; in vec2 vUv; uniform sampler2D uTex; uniform vec2 uDir; out vec4 o;
+void main(){
+  vec3 c=texture(uTex,vUv).rgb*0.2270;
+  c+=(texture(uTex,vUv+uDir*1.3846).rgb+texture(uTex,vUv-uDir*1.3846).rgb)*0.3162;
+  c+=(texture(uTex,vUv+uDir*3.2308).rgb+texture(uTex,vUv-uDir*3.2308).rgb)*0.0703;
+  o=vec4(c,1.);
+}`;
+const FS_FINAL = `#version 300 es
+precision highp float; in vec2 vUv; uniform sampler2D uTex, uBloom; uniform float uBloomK; out vec4 o;
+void main(){
+  vec3 c=texture(uTex,vUv).rgb+texture(uBloom,vUv).rgb*uBloomK;
+  float l=dot(c,vec3(0.3,0.59,0.11));
+  c=clamp(mix(vec3(l),c,1.08),0.,1.);            // a touch more saturation
+  c=c*c*(3.-2.*c)*0.35+c*0.65;                   // gentle filmic contrast
+  o=vec4(c,1.);
+}`;
+
+function mkProg(vs, fs) {
+  const sh = (type, src) => {
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src); gl.compileShader(s);
+    if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error('Shader: ' + gl.getShaderInfoLog(s));
+    return s;
+  };
+  const p = gl.createProgram();
+  gl.attachShader(p, sh(gl.VERTEX_SHADER, vs)); gl.attachShader(p, sh(gl.FRAGMENT_SHADER, fs));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('Link: ' + gl.getProgramInfoLog(p));
+  const cache = {};
+  return { p, u: n => (n in cache ? cache[n] : (cache[n] = gl.getUniformLocation(p, n))) };
+}
+
+// vertex layouts: static = pos3 nor3 col4 mat4 uv2 (16 floats); skin = pos3 nor3 col4 mat4 bone4 wgt4 (22)
+function mkMesh(kind, verts, idx) {
+  const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+  const sizes = kind === 'skin' ? [3, 3, 4, 4, 4, 4] : [3, 3, 4, 4, 2];
+  const stride = sizes.reduce((a, b) => a + b, 0) * 4;
+  let off = 0;
+  sizes.forEach((n, i) => { gl.enableVertexAttribArray(i); gl.vertexAttribPointer(i, n, gl.FLOAT, false, stride, off); off += n * 4; });
+  const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+  gl.bindVertexArray(null);
+  return { vao, count: idx.length };
+}
+
+function mkTarget(w, h) {
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, w, h, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
+  return { tex, fbo, w, h };
+}
+
+function glResize() {
+  const w = Math.max(2, Math.round(W * RS)), h = Math.max(2, Math.round(H * RS));
+  glCanvas.width = w; glCanvas.height = h;
+  for (const t of [R.resolve, R.bloomA, R.bloomB]) if (t) { gl.deleteTexture(t.tex); gl.deleteFramebuffer(t.fbo); }
+  if (R.msaa) { gl.deleteRenderbuffer(R.msaa.color); gl.deleteRenderbuffer(R.msaa.depth); gl.deleteFramebuffer(R.msaa.fbo); }
+  const samples = Math.min(CONFIG.gfx.msaa, gl.getParameter(gl.MAX_SAMPLES));
+  const color = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, color);
+  gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.RGBA8, w, h);
+  const depth = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, depth);
+  gl.renderbufferStorageMultisample(gl.RENDERBUFFER, samples, gl.DEPTH_COMPONENT24, w, h);
+  const fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.RENDERBUFFER, color);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, depth);
+  R.msaa = { fbo, color, depth, w, h };
+  R.resolve = mkTarget(w, h);
+  const bw = Math.max(2, w >> 2), bh = Math.max(2, h >> 2);
+  R.bloomA = mkTarget(bw, bh); R.bloomB = mkTarget(bw, bh);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+function glInit() {
+  gl = glCanvas.getContext('webgl2', { antialias: false, alpha: false, depth: false, stencil: false, powerPreference: 'high-performance' });
+  if (!gl) return false;
+  R.scene = mkProg(VS_STATIC, FS_SCENE); R.skin = mkProg(VS_SKIN, FS_SCENE);
+  R.depthS = mkProg(VS_DEPTH_STATIC, FS_DEPTH); R.depthK = mkProg(VS_DEPTH_SKIN, FS_DEPTH);
+  R.sky = mkProg(VS_FULL, FS_SKY); R.part = mkProg(VS_PART, FS_PART);
+  R.bright = mkProg(VS_FULL, FS_BRIGHT); R.blur = mkProg(VS_FULL, FS_BLUR); R.final = mkProg(VS_FULL, FS_FINAL);
+  R.emptyVao = gl.createVertexArray();
+
+  // shadow map
+  const SR = CONFIG.gfx.shadowRes;
+  R.shadowTex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, R.shadowTex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.DEPTH_COMPONENT24, SR, SR, 0, gl.DEPTH_COMPONENT, gl.UNSIGNED_INT, null);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_MODE, gl.COMPARE_REF_TO_TEXTURE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_COMPARE_FUNC, gl.LEQUAL);
+  R.shadowFbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, R.shadowFbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.TEXTURE_2D, R.shadowTex, 0);
+  gl.drawBuffers([gl.NONE]); gl.readBuffer(gl.NONE);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+  // sun + shadow projection (the sun never moves)
+  const az = CONFIG.gfx.sunAzimuth * Math.PI / 180, el = CONFIG.gfx.sunElevation * Math.PI / 180;
+  R.sun = vnorm([Math.sin(az) * Math.cos(el), Math.sin(el), Math.cos(az) * Math.cos(el)]);
+  const X = vnorm(vcross([0, 1, 0], R.sun)), Y = vcross(R.sun, X), Z = vmul(R.sun, -1);
+  const lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9];
+  for (const x of [-11, 11]) for (const y of [-0.5, 9.5]) for (const z of [-3, 50]) {
+    const q = [vdot([x, y, z], X), vdot([x, y, z], Y), vdot([x, y, z], Z)];
+    for (let i = 0; i < 3; i++) { lo[i] = Math.min(lo[i], q[i]); hi[i] = Math.max(hi[i], q[i]); }
+  }
+  lo[2] -= 110;
+  const L = new Float32Array(16), ax = [X, Y, Z];
+  for (let r = 0; r < 3; r++) {
+    const k = 2 / (hi[r] - lo[r]);
+    L[r] = ax[r][0] * k; L[4 + r] = ax[r][1] * k; L[8 + r] = ax[r][2] * k; L[12 + r] = -lo[r] * k - 1;
+  }
+  L[15] = 1;
+  R.lightVP = L;
+  R.partBuf = gl.createBuffer(); R.partVao = gl.createVertexArray();
+  gl.bindVertexArray(R.partVao); gl.bindBuffer(gl.ARRAY_BUFFER, R.partBuf);
+  [[3, 0], [2, 12], [4, 20], [3, 36]].forEach(([n, off], i) => { gl.enableVertexAttribArray(i); gl.vertexAttribPointer(i, n, gl.FLOAT, false, 48, off); });
+  gl.bindVertexArray(null);
+  R.ok = true;
+  return true;
+}
+
+/* =====================================================================
+   7. GEOMETRY BUILDER & THE TOWN — every mesh is generated here
+   ===================================================================== */
+const lin = c => [Math.pow(c[0] / 255, 2.2), Math.pow(c[1] / 255, 2.2), Math.pow(c[2] / 255, 2.2)];
+// material: colour (sRGB 0-255), roughness, metalness, surface pattern id, emissive
+const mat = (c, r, m, p, e) => ({ c: lin(c), r, m: m || 0, p: p || 0, e: e || 0 });
+
+class Geo {
+  constructor() { this.v = []; this.i = []; this.n = 0; this.R = null; this.t = null; }
+  xf(R0, t) { this.R = R0; this.t = t; }
+  vtx(p, nr, m, u, v, ao) {
+    if (this.R) { p = vadd(m3v(this.R, p), this.t); nr = m3v(this.R, nr); }
+    this.v.push(p[0], p[1], p[2], nr[0], nr[1], nr[2], m.c[0], m.c[1], m.c[2], ao === undefined ? 1 : ao, m.r, m.m, m.p, m.e, u, v);
+    return this.n++;
+  }
+  // a,b,c,d in order around the quad; uv = [u0,v0,u1,v1] (defaults to metres)
+  quad(a, b, c, d, m, uv, ao) {
+    const nr = vnorm(vcross(vsub(b, a), vsub(d, a)));
+    const q = uv || [0, 0, vlen(vsub(b, a)), vlen(vsub(d, a))], A = ao || [1, 1, 1, 1];
+    const i0 = this.vtx(a, nr, m, q[0], q[1], A[0]), i1 = this.vtx(b, nr, m, q[2], q[1], A[1]);
+    const i2 = this.vtx(c, nr, m, q[2], q[3], A[2]), i3 = this.vtx(d, nr, m, q[0], q[3], A[3]);
+    this.i.push(i0, i1, i2, i0, i2, i3);
+  }
+  // axis-aligned box; side faces map u to the horizontal axis and v to height, so patterns line up
+  box(x0, y0, z0, x1, y1, z1, m, o) {
+    o = o || {};
+    const lo = o.aoLo === undefined ? 1 : o.aoLo, A = [lo, lo, 1, 1];
+    this.quad([x0, y0, z0], [x0, y0, z1], [x0, y1, z1], [x0, y1, z0], m, [z0, y0, z1, y1], A);
+    this.quad([x1, y0, z0], [x1, y0, z1], [x1, y1, z1], [x1, y1, z0], m, [z0, y0, z1, y1], A);
+    this.quad([x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0], m, [x0, y0, x1, y1], A);
+    this.quad([x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1], m, [x0, y0, x1, y1], A);
+    this.quad([x0, y1, z0], [x1, y1, z0], [x1, y1, z1], [x0, y1, z1], m, [x0, z0, x1, z1]);
+    if (o.bottom) this.quad([x0, y0, z0], [x1, y0, z0], [x1, y0, z1], [x0, y0, z1], m, [x0, z0, x1, z1], [lo, lo, lo, lo]);
+  }
+  // oriented box from a corner and three edge vectors
+  obox(o, ex, ey, ez, m) {
+    const c = (i, j, k) => vadd(o, vadd(vmul(ex, i), vadd(vmul(ey, j), vmul(ez, k))));
+    this.quad(c(0, 0, 0), c(0, 0, 1), c(0, 1, 1), c(0, 1, 0), m); this.quad(c(1, 0, 0), c(1, 0, 1), c(1, 1, 1), c(1, 1, 0), m);
+    this.quad(c(0, 0, 0), c(1, 0, 0), c(1, 1, 0), c(0, 1, 0), m); this.quad(c(0, 0, 1), c(1, 0, 1), c(1, 1, 1), c(0, 1, 1), m);
+    this.quad(c(0, 0, 0), c(1, 0, 0), c(1, 0, 1), c(0, 0, 1), m); this.quad(c(0, 1, 0), c(1, 1, 0), c(1, 1, 1), c(0, 1, 1), m);
+  }
+  // a beam of square section between two points
+  beam(a, b, w, m) {
+    const d = vnorm(vsub(b, a)), up = Math.abs(d[1]) > 0.9 ? [1, 0, 0] : [0, 1, 0];
+    const x = vmul(vnorm(vcross(up, d)), w), y = vmul(vnorm(vcross(d, x)), w);
+    this.obox(vsub(vsub(a, vmul(x, 0.5)), vmul(y, 0.5)), x, y, vsub(b, a), m);
+  }
+  cyl(a, b, r0, r1, seg, m, caps) {
+    const d = vnorm(vsub(b, a)), up = Math.abs(d[1]) > 0.9 ? [1, 0, 0] : [0, 1, 0];
+    const x = vnorm(vcross(up, d)), y = vcross(d, x), len = vlen(vsub(b, a)), base = this.n;
+    for (let i = 0; i <= seg; i++) {
+      const t = i / seg * TAU, nr = vadd(vmul(x, Math.cos(t)), vmul(y, Math.sin(t)));
+      this.vtx(vadd(a, vmul(nr, r0)), nr, m, t * r0, 0); this.vtx(vadd(b, vmul(nr, r1)), nr, m, t * r1, len);
+    }
+    for (let i = 0; i < seg; i++) { const k = base + i * 2; this.i.push(k, k + 1, k + 3, k, k + 3, k + 2); }
+    if (caps) for (const [c, r, s] of [[a, r0, -1], [b, r1, 1]]) {
+      const ci = this.vtx(c, vmul(d, s), m, 0, 0), b2 = this.n;
+      for (let i = 0; i <= seg; i++) { const t = i / seg * TAU; this.vtx(vadd(c, vadd(vmul(x, Math.cos(t) * r), vmul(y, Math.sin(t) * r))), vmul(d, s), m, Math.cos(t) * r, Math.sin(t) * r); }
+      for (let i = 0; i < seg; i++) this.i.push(ci, b2 + i, b2 + i + 1);
+    }
+  }
+  // surface of revolution around the vertical axis through c; profile = [[radius, height], ...]
+  lathe(c, prof, seg, m) {
+    const base = this.n, np = prof.length;
+    for (let j = 0; j < np; j++) {
+      const a = prof[Math.max(0, j - 1)], b = prof[Math.min(np - 1, j + 1)];
+      const nl = Math.hypot(b[1] - a[1], b[0] - a[0]) || 1, nr = (b[1] - a[1]) / nl, ny = -(b[0] - a[0]) / nl;
+      for (let i = 0; i <= seg; i++) {
+        const t = i / seg * TAU, cx = Math.cos(t), cz = Math.sin(t);
+        this.vtx([c[0] + cx * prof[j][0], c[1] + prof[j][1], c[2] + cz * prof[j][0]], [cx * nr, ny, cz * nr], m, t * 0.3, prof[j][1]);
+      }
+    }
+    for (let j = 0; j < np - 1; j++) for (let i = 0; i < seg; i++) {
+      const k = base + j * (seg + 1) + i, k2 = k + seg + 1;
+      this.i.push(k, k2, k2 + 1, k, k2 + 1, k + 1);
+    }
+  }
+  // lumpy rock
+  blob(c, r, seed, m) {
+    const rng = mulberry32(seed), base = this.n, ns = 7, nt = 9, sq = [rng() * 0.5 + 0.6, rng() * 0.4 + 0.45, rng() * 0.5 + 0.6];
+    const bump = []; for (let i = 0; i < 12; i++) bump.push(rng() * 0.5 + 0.75);
+    for (let j = 0; j <= ns; j++) for (let i = 0; i <= nt; i++) {
+      const ph = j / ns * Math.PI, th = i / nt * TAU;
+      const d = [Math.sin(ph) * Math.cos(th), Math.cos(ph), Math.sin(ph) * Math.sin(th)];
+      const k = bump[(j * 3 + (i % nt)) % 12] * (j === 0 || j === ns ? 0.9 : 1);
+      this.vtx([c[0] + d[0] * r * sq[0] * k, c[1] + d[1] * r * sq[1] * k, c[2] + d[2] * r * sq[2] * k], d, m, i, j, 0.55 + 0.45 * (d[1] * 0.5 + 0.5));
+    }
+    for (let j = 0; j < ns; j++) for (let i = 0; i < nt; i++) { const k = base + j * (nt + 1) + i, k2 = k + nt + 1; this.i.push(k, k2, k2 + 1, k, k2 + 1, k + 1); }
+  }
+  mesh() { return mkMesh('static', new Float32Array(this.v), new Uint32Array(this.i)); }
+}
+
+// painted sign boards: text drawn to a canvas, uploaded once as a texture
+const SIGNS = ['SALOON', 'BANK', 'HOTEL', 'GUNSMITH', 'LIVERY', 'ASSAY OFFICE', 'BARBER', 'DRY GOODS', 'UNDERTAKER', 'TELEGRAPH'];
+function buildAtlas() {
+  const cv = document.createElement('canvas'); cv.width = 1024; cv.height = 640;
+  const c = cv.getContext('2d'), rng = mulberry32(77);
+  const styles = [['#3b2416', '#ecd29a'], ['#e6d6b0', '#3a2014'], ['#5a2018', '#f0d8a0'], ['#24382e', '#e8d8a8'], ['#2a2420', '#d8b060']];
+  const rects = {};
+  SIGNS.forEach((name, i) => {
+    const x = (i % 2) * 512, y = (i >> 1) * 128, st = styles[i % styles.length];
+    c.fillStyle = st[0]; c.fillRect(x, y, 512, 128);
+    for (let k = 0; k < 260; k++) {                       // weathering streaks
+      c.fillStyle = `rgba(${rng() < 0.5 ? '0,0,0' : '255,240,210'},${rng() * 0.06})`;
+      c.fillRect(x + rng() * 512, y + rng() * 128, 20 + rng() * 120, 1 + rng() * 2);
+    }
+    c.strokeStyle = st[1]; c.lineWidth = 4; c.strokeRect(x + 10, y + 10, 492, 108);
+    c.lineWidth = 1.5; c.strokeRect(x + 18, y + 18, 476, 92);
+    let fs = 74; c.font = `700 ${fs}px ${SERIF}`;
+    const tw = c.measureText(name).width;
+    if (tw > 430) { fs *= 430 / tw; c.font = `700 ${fs}px ${SERIF}`; }
+    c.fillStyle = st[1]; c.textAlign = 'center'; c.textBaseline = 'middle';
+    c.fillText(name, x + 256, y + 66);
+    rects[name] = [x / 1024, y / 640, (x + 512) / 1024, (y + 128) / 640];
+  });
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, gl.RGBA, gl.UNSIGNED_BYTE, cv);
+  gl.generateMipmap(gl.TEXTURE_2D);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  const an = gl.getExtension('EXT_texture_filter_anisotropic');
+  if (an) gl.texParameterf(gl.TEXTURE_2D, an.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, gl.getParameter(an.MAX_TEXTURE_MAX_ANISOTROPY_EXT)));
+  R.atlas = tex;
+  return rects;
+}
+
+function buildTown() {
+  const g = new Geo(), rng = mulberry32(4242), signUV = buildAtlas();
+  const M = {
+    ground: mat([150, 104, 64], 0.95, 0, 3),
+    planks: mat([128, 92, 60], 0.85, 0, 2),
+    post: mat([120, 84, 54], 0.8, 0, 6),
+    roof: mat([84, 62, 48], 0.9, 0, 2),
+    dark: mat([40, 30, 26], 0.85),
+    iron: mat([58, 56, 58], 0.45, 0.9),
+    brass: mat([210, 166, 84], 0.35, 1),
+    glassLit: mat([20, 14, 8], 0.2, 0, 4, 1),
+    glassDark: mat([8, 9, 12], 0.07, 0, 4, 0),
+    doorway: mat([20, 12, 6], 0.3, 0, 4, 0.8),
+    barrel: mat([124, 82, 48], 0.75, 0, 6),
+    rock: mat([118, 96, 80], 0.95),
+    cream: mat([214, 196, 158], 0.8),
+    lamp: mat([30, 20, 10], 0.3, 0, 4, 2.2),
+    rope: mat([150, 124, 84], 0.9),
+    signBoard: mat([255, 255, 255], 0.8, 0, 5),
+  };
+  // the street itself: one big slab, drawn first so it can be skipped when rendering shadows
+  g.quad([-400, 0, -30], [400, 0, -30], [400, 0, 700], [-400, 0, 700], M.ground);
+  const groundCount = g.i.length;
+
+  const WOOD = [[156, 108, 72], [176, 132, 92], [132, 92, 64], [198, 172, 136], [146, 78, 58], [118, 106, 90], [104, 122, 108], [168, 118, 70]];
+  const TRIM = [[216, 196, 156], [92, 60, 42], [200, 176, 130], [70, 48, 38]];
+  let signI = 0;
+
+  function building(side, z1, z2, o) {
+    const X = side * STREET_HALF, dir = -side, w = z2 - z1, zc = (z1 + z2) / 2, h = o.h, hb = h - 0.85;
+    // fb(): a box given as distances out from the facade (a0..a1, toward the street), heights and z range
+    const fb = (a0, a1, y0, y1, za, zb, m, op) => g.box(Math.min(X + dir * a0, X + dir * a1), y0, za, Math.max(X + dir * a0, X + dir * a1), y1, zb, m, op);
+    const wall = mat(o.col, 0.85, 0, o.vertical ? 6 : 1), trim = mat(o.trim, 0.75, 0, 0);
+    const trimD = mat(shade(o.trim, 0.72), 0.78);
+
+    fb(-9, 0, 0, hb, z1, z2, wall, { aoLo: 0.72 });                         // main volume
+    fb(-0.18, 0.0, hb, h, z1, z2, wall);                                    // false front
+    if (o.stepped) fb(-0.18, 0.0, h, h + 0.7, zc - w * 0.24, zc + w * 0.24, wall);
+    const top = o.stepped ? h + 0.7 : h;
+    fb(0, 0.22, h - 0.14, h, z1 - 0.06, z2 + 0.06, trim); fb(0, 0.13, h - 0.3, h - 0.14, z1 - 0.03, z2 + 0.03, trimD);
+    if (o.stepped) fb(0, 0.2, top - 0.13, top, zc - w * 0.24 - 0.05, zc + w * 0.24 + 0.05, trim);
+    for (let z = z1 + 0.35; z < z2 - 0.2; z += 0.95) fb(0, 0.15, h - 0.52, h - 0.3, z, z + 0.09, trimD);   // cornice brackets
+    fb(0, 0.045, 0.25, hb, z1, z1 + 0.15, trim); fb(0, 0.045, 0.25, hb, z2 - 0.15, z2, trim);             // corner boards
+    fb(0, 0.05, 0.25, 0.5, z1, z2, trimD);                                                                 // skirting
+
+    // boardwalk + step
+    fb(0, 2.15, 0, 0.25, z1 - 0.12, z2 + 0.12, M.planks, { aoLo: 0.6 });
+    fb(2.15, 2.5, 0, 0.12, zc - 0.9, zc + 0.9, M.planks, { aoLo: 0.6 });
+
+    // openings
+    const two = hb > 5.5, bays = Math.max(2, Math.round(w / 2.6)), bw = w / bays, door = bays >> 1;
+    const win = (z, ww, y0, y1, lit) => {
+      const x = X + dir * 0.02;
+      g.quad([x, y0, z - ww / 2], [x, y0, z + ww / 2], [x, y1, z + ww / 2], [x, y1, z - ww / 2], lit ? M.glassLit : M.glassDark, [0, 0, 1, 1]);
+      fb(0, 0.085, y0 - 0.08, y0, z - ww / 2 - 0.08, z + ww / 2 + 0.08, trim); fb(0, 0.13, y0 - 0.12, y0 - 0.07, z - ww / 2 - 0.12, z + ww / 2 + 0.12, trim);
+      fb(0, 0.085, y1, y1 + 0.09, z - ww / 2 - 0.08, z + ww / 2 + 0.08, trim); fb(0, 0.12, y1 + 0.09, y1 + 0.13, z - ww / 2 - 0.11, z + ww / 2 + 0.11, trim);
+      fb(0, 0.085, y0, y1, z - ww / 2 - 0.08, z - ww / 2, trim); fb(0, 0.085, y0, y1, z + ww / 2, z + ww / 2 + 0.08, trim);
+      fb(0.02, 0.05, y0, y1, z - 0.018, z + 0.018, trim); fb(0.02, 0.05, (y0 + y1) / 2 - 0.018, (y0 + y1) / 2 + 0.018, z - ww / 2, z + ww / 2, trim);
+      if (o.shutters) {
+        const sm = mat(o.shutter, 0.8, 0, 1);
+        fb(0, 0.04, y0, y1, z - ww / 2 - 0.5, z - ww / 2 - 0.1, sm); fb(0, 0.04, y0, y1, z + ww / 2 + 0.1, z + ww / 2 + 0.5, sm);
+      }
+    };
+    for (let i = 0; i < bays; i++) {
+      const z = z1 + (i + 0.5) * bw;
+      if (i === door) {
+        if (o.saloon) {                                   // open doorway spilling lamplight, with batwing doors
+          const x = X + dir * 0.02;
+          g.quad([x, 0.25, z - 0.62], [x, 0.25, z + 0.62], [x, 2.45, z + 0.62], [x, 2.45, z - 0.62], M.doorway, [0.3, 0, 0.7, 1]);
+          const bm = mat([120, 74, 44], 0.7, 0, 6);
+          fb(0.05, 0.085, 0.95, 1.85, z - 0.6, z - 0.03, bm); fb(0.05, 0.085, 0.95, 1.85, z + 0.03, z + 0.6, bm);
+        } else {
+          fb(-0.02, 0.03, 0.25, 2.38, z - 0.5, z + 0.5, mat(shade(o.col, 0.55), 0.8, 0, 6));
+          fb(0.03, 0.06, 0.4, 1.2, z - 0.4, z + 0.4, mat(shade(o.col, 0.48), 0.8)); fb(0.03, 0.06, 1.35, 2.25, z - 0.4, z + 0.4, mat(shade(o.col, 0.48), 0.8));
+          fb(0.03, 0.09, 1.22, 1.3, z + 0.34, z + 0.4, M.brass);
+        }
+        fb(0, 0.09, 0.25, 2.5, z - 0.72, z - 0.62, trim); fb(0, 0.09, 0.25, 2.5, z + 0.62, z + 0.72, trim); fb(0, 0.11, 2.45, 2.58, z - 0.76, z + 0.76, trim);
+      } else win(z, Math.min(1.2, bw * 0.5), 1.2, 2.42, rng() < 0.5);
+      if (two) win(z, Math.min(0.95, bw * 0.4), 3.95, 5.05, rng() < 0.45);
+    }
+
+    // porch: posts, roof (or balcony), fascia, railing
+    if (o.porch) {
+      const np = Math.max(2, Math.round(w / 2.9)), py = o.balcony ? 3.02 : 2.82;
+      if (o.balcony) {
+        fb(0, 2.1, 2.92, 3.04, z1 + 0.05, z2 - 0.05, M.planks);
+        for (let z = z1 + 0.12; z < z2 - 0.1; z += 0.17) fb(1.99, 2.03, 3.04, 3.86, z, z + 0.035, trim);
+        fb(1.96, 2.06, 3.86, 3.94, z1 + 0.05, z2 - 0.05, trim); fb(1.98, 2.04, 3.1, 3.15, z1 + 0.05, z2 - 0.05, trim);
+      } else {
+        g.obox([X, 3.1, z1 + 0.05], [dir * 2.15, -0.28, 0], [0, 0.07, 0], [0, 0, w - 0.1], M.roof);
+      }
+      fb(2.02, 2.08, py - 0.2, py, z1 + 0.05, z2 - 0.05, trim);
+      for (let i = 0; i <= np; i++) {
+        const z = z1 + 0.22 + i * (w - 0.44) / np;
+        fb(1.86, 1.99, 0.25, py - 0.02, z - 0.065, z + 0.065, M.post);
+        fb(1.82, 2.03, py - 0.2, py - 0.06, z - 0.105, z + 0.105, M.post); fb(1.83, 2.02, 0.25, 0.4, z - 0.095, z + 0.095, M.post);
+        if (i < np) {
+          const zn = z + (w - 0.44) / np;
+          g.beam([X + dir * 1.92, py - 0.5, z + 0.07], [X + dir * 1.92, py - 0.12, z + 0.45], 0.055, M.post);
+          g.beam([X + dir * 1.92, py - 0.5, zn - 0.07], [X + dir * 1.92, py - 0.12, zn - 0.45], 0.055, M.post);
+          if (o.rail && !(zc > z && zc < zn)) {
+            fb(1.89, 1.96, 1.1, 1.17, z, zn, trim); fb(1.9, 1.95, 0.42, 0.47, z, zn, trim);
+            for (let q = z + 0.16; q < zn - 0.08; q += 0.16) fb(1.905, 1.945, 0.47, 1.1, q - 0.017, q + 0.017, trim);
+          }
+        }
+        if (o.lamp && (i === 1 || i === np - 1)) {       // hanging lantern
+          const lx = X + dir * 1.6, ly = py - 0.62;
+          g.beam([lx, py - 0.1, z], [lx, ly + 0.22, z], 0.012, M.iron);
+          g.box(lx - 0.06, ly + 0.2, z - 0.06, lx + 0.06, ly + 0.23, z + 0.06, M.iron, { bottom: true });
+          g.box(lx - 0.045, ly, z - 0.045, lx + 0.045, ly + 0.2, z + 0.045, M.lamp, { bottom: true });
+          g.box(lx - 0.06, ly - 0.03, z - 0.06, lx + 0.06, ly, z + 0.06, M.iron, { bottom: true });
+        }
+      }
+    }
+
+    // signs: one painted across the false front, one hanging shingle facing up and down the street
+    if (o.sign) {
+      const uv = signUV[o.sign], sw = Math.min(w * 0.72, 5.2), sh = sw / 4, y0 = Math.max(o.porch ? 3.35 : 2.9, hb - 0.1 - sh * 0.5 - (two ? -0.2 : 0.5));
+      const ys = two ? hb - sh * 0.2 : y0, x = X + dir * 0.07;
+      fb(0, 0.06, ys - 0.06, ys + sh + 0.06, zc - sw / 2 - 0.06, zc + sw / 2 + 0.06, trimD);
+      const za = zc + side * sw / 2, zb = zc - side * sw / 2;       // text reads left-to-right for someone facing the wall
+      g.quad([x, ys, za], [x, ys, zb], [x, ys + sh, zb], [x, ys + sh, za], M.signBoard, [uv[0], uv[3], uv[2], uv[1]]);
+      if (o.porch && !o.balcony) {
+        const zs = z1 + 0.5, xa = X + dir * 0.45, xb = X + dir * 1.75, yb = 2.0, yt = 2.42;
+        g.box(Math.min(xa, xb), yb, zs - 0.025, Math.max(xa, xb), yt, zs + 0.025, trimD, { bottom: true });
+        const xl = Math.min(xa, xb) + 0.03, xr = Math.max(xa, xb) - 0.03;
+        g.quad([xl, yb + 0.03, zs - 0.027], [xr, yb + 0.03, zs - 0.027], [xr, yt - 0.03, zs - 0.027], [xl, yt - 0.03, zs - 0.027], M.signBoard, [uv[0], uv[3], uv[2], uv[1]]);
+        g.quad([xr, yb + 0.03, zs + 0.027], [xl, yb + 0.03, zs + 0.027], [xl, yt - 0.03, zs + 0.027], [xr, yt - 0.03, zs + 0.027], M.signBoard, [uv[0], uv[3], uv[2], uv[1]]);
+        for (const xx of [xl + 0.12, xr - 0.12]) g.beam([xx, yt, zs], [xx, 2.74, zs], 0.014, M.iron);
+      }
+    }
+    // stove pipe
+    if (o.pipe) { const px = X + side * 2.2, pz = z1 + w * 0.3; g.cyl([px, hb, pz], [px, hb + 1.5, pz], 0.09, 0.09, 10, M.iron, false); g.cyl([px, hb + 1.5, pz], [px, hb + 1.62, pz], 0.15, 0.15, 10, M.iron, true); }
+  }
+
+  for (const side of [-1, 1]) {
+    let z = 1.2;
+    while (z < 58) {
+      const w = 6 + rng() * 4.2, h = 4.7 + rng() * 3.2, porch = rng() < 0.85, tall = h - 0.85 > 5.5;
+      const name = rng() < 0.82 ? SIGNS[signI++ % SIGNS.length] : null;
+      building(side, z, z + w, {
+        h, col: WOOD[(rng() * WOOD.length) | 0], trim: TRIM[(rng() * TRIM.length) | 0], vertical: rng() < 0.28,
+        stepped: rng() < 0.4, porch, balcony: porch && tall && rng() < 0.6, rail: rng() < 0.45, lamp: rng() < 0.7,
+        shutters: rng() < 0.35, shutter: [[62, 84, 70], [96, 44, 36], [58, 62, 84]][(rng() * 3) | 0],
+        saloon: name === 'SALOON' || name === 'HOTEL', sign: name, pipe: rng() < 0.6,
+      });
+      z += w + (rng() < 0.3 ? 1.5 + rng() * 1.8 : 0.14);
+    }
+  }
+
+  // ---- street dressing ----
+  const barrel = (x, z, s) => {
+    s = s || 1;
+    const prof = [[0.24, 0], [0.285, 0.14], [0.31, 0.45], [0.285, 0.76], [0.24, 0.9]].map(p => [p[0] * s, p[1] * s]);
+    g.lathe([x, 0, z], prof, 18, M.barrel);
+    for (const y of [0.1, 0.3, 0.6, 0.8]) { const r = (0.31 - Math.abs(y - 0.45) * 0.16 + 0.006) * s; g.lathe([x, 0, z], [[r, (y - 0.025) * s], [r + 0.004, y * s], [r, (y + 0.025) * s]], 18, M.iron); }
+    g.lathe([x, 0, z], [[0.235 * s, 0.9 * s], [0.225 * s, 0.86 * s], [0.0, 0.86 * s]], 18, M.barrel);
+  };
+  const crate = (x, z, s, yaw) => {
+    g.xf(rotY(yaw), [x, 0, z]);
+    const m = mat([150, 112, 70], 0.85, 0, 1), d = mat([104, 74, 46], 0.85);
+    g.box(-s / 2, 0, -s / 2, s / 2, s, s / 2, m, { aoLo: 0.7 });
+    for (const a of [-1, 1]) {
+      g.box(a * s / 2 - 0.012, 0, -s / 2 - 0.012, a * s / 2 + 0.012, s + 0.01, -s / 2 + 0.07, d); g.box(a * s / 2 - 0.012, 0, s / 2 - 0.07, a * s / 2 + 0.012, s + 0.01, s / 2 + 0.012, d);
+      g.box(-s / 2, 0, a * s / 2 - 0.012, -s / 2 + 0.07, s + 0.01, a * s / 2 + 0.012, d); g.box(s / 2 - 0.07, 0, a * s / 2 - 0.012, s / 2, s + 0.01, a * s / 2 + 0.012, d);
+    }
+    g.xf(null);
+  };
+  const rail = (x, za, zb) => {
+    for (const z of [za, (za + zb) / 2, zb]) g.box(x - 0.06, 0, z - 0.06, x + 0.06, 1.08, z + 0.06, M.post, { aoLo: 0.6 });
+    g.cyl([x, 1.0, za - 0.25], [x, 1.0, zb + 0.25], 0.045, 0.045, 8, M.post, true);
+  };
+  const trough = (x, z) => {
+    const m = mat([112, 80, 54], 0.85, 0, 1);
+    g.box(x - 0.32, 0.12, z - 0.9, x + 0.32, 0.5, z + 0.9, m, { aoLo: 0.6 });
+    g.quad([x - 0.27, 0.46, z - 0.85], [x + 0.27, 0.46, z - 0.85], [x + 0.27, 0.46, z + 0.85], [x - 0.27, 0.46, z + 0.85], mat([20, 26, 30], 0.05));
+    for (const zz of [z - 0.7, z + 0.7]) g.box(x - 0.36, 0, zz - 0.06, x + 0.36, 0.56, zz + 0.06, M.post, { aoLo: 0.6 });
+  };
+  const wheel = (c, Rm, r) => {
+    g.xf(Rm, c);
+    g.lathe([0, 0, 0], [[r - 0.05, -0.03], [r, -0.03], [r, 0.03], [r - 0.05, 0.03], [r - 0.05, -0.03]], 28, M.post);
+    g.lathe([0, 0, 0], [[r + 0.003, -0.032], [r + 0.008, 0], [r + 0.003, 0.032]], 28, M.iron);
+    g.cyl([0, -0.09, 0], [0, 0.09, 0], 0.085, 0.07, 12, M.post, true);
+    for (let i = 0; i < 12; i++) { const a = i / 12 * TAU; g.beam([Math.cos(a) * 0.07, 0, Math.sin(a) * 0.07], [Math.cos(a) * (r - 0.04), 0, Math.sin(a) * (r - 0.04)], 0.036, M.post); }
+    g.xf(null);
+  };
+  const wagon = (x, z, yaw) => {
+    const Rw = rotY(yaw), T = p => vadd(m3v(Rw, p), [x, 0, z]), m = mat([126, 86, 52], 0.85, 0, 1);
+    g.xf(Rw, [x, 0, z]);
+    g.box(-0.75, 0.78, -1.5, 0.75, 0.86, 1.5, M.planks, { bottom: true });
+    g.box(-0.78, 0.86, -1.5, -0.73, 1.3, 1.5, m); g.box(0.73, 0.86, -1.5, 0.78, 1.3, 1.5, m);
+    g.box(-0.78, 0.86, -1.53, 0.78, 1.3, -1.48, m); g.box(-0.78, 0.86, 1.48, 0.78, 1.22, 1.53, m);
+    g.box(-0.6, 1.3, 1.0, 0.6, 1.36, 1.4, M.planks, { bottom: true });
+    g.cyl([-0.95, 0.6, -1.05], [0.95, 0.6, -1.05], 0.04, 0.04, 8, M.iron, true); g.cyl([-0.95, 0.52, 1.05], [0.95, 0.52, 1.05], 0.04, 0.04, 8, M.iron, true);
+    g.beam([0, 0.6, 1.5], [0.1, 0.25, 3.6], 0.07, M.post);
+    g.xf(null);
+    const Rx = m3mul(Rw, rotZ(Math.PI / 2));
+    for (const sx of [-0.92, 0.92]) { wheel(T([sx, 0.6, -1.05]), Rx, 0.6); wheel(T([sx, 0.52, 1.05]), Rx, 0.52); }
+  };
+
+  barrel(-3.15, 9.2); barrel(-3.3, 9.85, 0.92); barrel(3.2, 12.4); barrel(-3.2, 20.5); barrel(3.25, 26.2); barrel(3.1, 26.9, 0.9); barrel(-3.2, 33);
+  crate(3.25, 8.3, 0.62, 0.3); crate(3.2, 9.0, 0.5, -0.4); crate(3.24, 8.45, 0.42, 0.9); crate(-3.2, 27.5, 0.6, 0.2); crate(3.2, 19.5, 0.55, 0.5);
+  rail(-3.0, 13.2, 16.4); rail(3.0, 21, 23.6); rail(-3.0, 37, 40);
+  trough(-3.05, 17.9); trough(3.05, 30.5);
+  wagon(3.1, 15.6, 0.12);
+  wheel([-3.02, 0.55, 23.4], m3mul(rotZ(Math.PI / 2 - 0.22), rotY(0.1)), 0.58);
+  for (let i = 0; i < 90; i++) {
+    const s = rng() < 0.5 ? -1 : 1, z = 2 + rng() * 70, x = z < 60 ? s * (2.6 + rng() * 0.75) : (rng() - 0.5) * 60, r = 0.03 + rng() * rng() * 0.16;
+    g.blob([x, r * 0.25, z], r, (rng() * 1e9) | 0, M.rock);
+  }
+  for (let i = 0; i < 40; i++) { const r = 0.02 + rng() * 0.05; g.blob([(rng() - 0.5) * 5, r * 0.2, 1.5 + rng() * 30], r, (rng() * 1e9) | 0, M.rock); }
+
+  // windmill at the end of the street
+  {
+    const bx = -4.2, bz = 82, hh = 9, m = mat([92, 62, 46], 0.9), b = 1.3, t = 0.28;
+    const leg = (sx, sz, y) => [bx + sx * lerp(b, t, y / hh), y, bz + sz * lerp(b, t, y / hh)];
+    for (const sx of [-1, 1]) for (const sz of [-1, 1]) g.beam(leg(sx, sz, 0), leg(sx, sz, hh), 0.14, m);
+    for (let y = 1.5; y < hh; y += 2.2) {
+      for (const [a, c] of [[[-1, -1], [1, -1]], [[1, -1], [1, 1]], [[1, 1], [-1, 1]], [[-1, 1], [-1, -1]]]) {
+        g.beam(leg(a[0], a[1], y), leg(c[0], c[1], y), 0.08, m);
+        if (y + 2.2 < hh) g.beam(leg(a[0], a[1], y), leg(c[0], c[1], y + 2.2), 0.06, m);
+      }
+    }
+    const hub = [bx, hh + 0.2, bz - 0.5];
+    g.cyl([bx, hh + 0.2, bz - 0.55], [bx, hh + 0.2, bz + 1.6], 0.06, 0.06, 8, M.iron, true);
+    for (let i = 0; i < 18; i++) {
+      const a = i / 18 * TAU, a2 = a + 0.2, r0 = 0.35, r1 = 1.75;
+      g.quad([hub[0] + Math.cos(a) * r0, hub[1] + Math.sin(a) * r0, hub[2]], [hub[0] + Math.cos(a) * r1, hub[1] + Math.sin(a) * r1, hub[2]],
+        [hub[0] + Math.cos(a2) * r1, hub[1] + Math.sin(a2) * r1, hub[2] + 0.12], [hub[0] + Math.cos(a2) * r0, hub[1] + Math.sin(a2) * r0, hub[2] + 0.04], m);
+    }
+    g.quad([bx, hh + 0.75, bz + 1.0], [bx, hh + 0.9, bz + 2.3], [bx, hh - 0.5, bz + 2.3], [bx, hh - 0.35, bz + 1.0], m);
+  }
+  // water tower beyond the last roofs
+  {
+    const cx = 10.5, cz = 66, m = mat([110, 74, 52], 0.9, 0, 6);
+    for (const [sx, sz] of [[-1, -1], [1, -1], [1, 1], [-1, 1]]) g.beam([cx + sx * 1.7, 0, cz + sz * 1.7], [cx + sx * 1.3, 6, cz + sz * 1.3], 0.22, m);
+    for (const [a, c] of [[[-1, -1], [1, -1]], [[1, -1], [1, 1]], [[1, 1], [-1, 1]], [[-1, 1], [-1, -1]]]) g.beam([cx + a[0] * 1.6, 2, cz + a[1] * 1.6], [cx + c[0] * 1.4, 5, cz + c[1] * 1.4], 0.1, m);
+    g.box(cx - 1.9, 6, cz - 1.9, cx + 1.9, 6.2, cz + 1.9, M.planks, { bottom: true });
+    g.lathe([cx, 6.2, cz], [[1.75, 0], [1.8, 1.4], [1.75, 2.8]], 24, m);
+    for (const y of [0.4, 1.4, 2.4]) g.lathe([cx, 6.2, cz], [[1.8, y - 0.05], [1.83, y], [1.8, y + 0.05]], 24, M.iron);
+    g.lathe([cx, 9.0, cz], [[1.95, 0], [0.0, 1.3]], 24, M.roof);
+  }
+  return { mesh: g.mesh(), groundCount };
+}
+
+// a tumbleweed: tangled loops of dry stalk
+function buildWeed() {
+  const g = new Geo(), rng = mulberry32(909), m = mat([150, 112, 62], 0.9);
+  for (let k = 0; k < 16; k++) {
+    const ax = vnorm([rng() - 0.5, rng() - 0.5, rng() - 0.5]), u = vnorm(vcross(ax, [0.3, 1, 0.2])), v = vcross(ax, u);
+    const r = 0.2 + rng() * 0.1, ph = rng() * 9, n = 22;
+    let prev = null;
+    for (let i = 0; i <= n; i++) {
+      const a = i / n * TAU, rr = r * (1 + 0.16 * Math.sin(a * 3 + ph) + 0.08 * Math.sin(a * 7 + ph * 2));
+      const p = vadd(vadd(vmul(u, Math.cos(a) * rr), vmul(v, Math.sin(a) * rr)), vmul(ax, 0.05 * Math.sin(a * 2 + ph)));
+      if (prev) g.beam(prev, p, 0.008, m);
+      prev = p;
+    }
+  }
+  return g.mesh();
+}
+
+/* =====================================================================
+   8. SCULPTING — characters are modelled as smooth-blended distance
+      fields (spheres, capsules, boxes...), then turned into triangle
+      meshes with automatic skin weights, colours and ambient occlusion.
+   ===================================================================== */
+const PS = 32;                           // floats per primitive
+const T_SPHERE = 0, T_CAPS = 1, T_BOX = 2, T_TORUS = 3, T_CYL = 4;
+
+function hash3i(i, j, k) {
+  let n = (Math.imul(i, 374761393) + Math.imul(j, 668265263) + Math.imul(k, 1274126177)) | 0;
+  n = Math.imul(n ^ (n >>> 13), 1274126177);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
+function noise3(x, y, z) {
+  const i = Math.floor(x), j = Math.floor(y), k = Math.floor(z);
+  let fx = x - i, fy = y - j, fz = z - k;
+  fx = fx * fx * (3 - 2 * fx); fy = fy * fy * (3 - 2 * fy); fz = fz * fz * (3 - 2 * fz);
+  const a = lerp(lerp(hash3i(i, j, k), hash3i(i + 1, j, k), fx), lerp(hash3i(i, j + 1, k), hash3i(i + 1, j + 1, k), fx), fy);
+  const b = lerp(lerp(hash3i(i, j, k + 1), hash3i(i + 1, j, k + 1), fx), lerp(hash3i(i, j + 1, k + 1), hash3i(i + 1, j + 1, k + 1), fx), fy);
+  return lerp(a, b, fz) - 0.5;
+}
+
+class Sculpt {
+  constructor() { this.d = []; this.n = 0; this.gR = null; this.gT = null; this.bs = []; }
+  group(R0, t) { this.gR = R0; this.gT = t; return this; }      // place following shapes in a local frame
+  _add(type, par, lr, o) {
+    o = o || {};
+    let c = o.c || [0, 0, 0], Rm = o.R || I3;
+    const s = o.s || [1, 1, 1];
+    if (this.gR) { c = vadd(m3v(this.gR, c), this.gT); Rm = m3mul(this.gR, Rm); }
+    const Rt = m3T(Rm), ident = Rm === I3;
+    const row = new Array(PS).fill(0);
+    row[0] = type; row[1] = o.k || 0; row[2] = o.sub ? 1 : 0; row[3] = o.mat || 0; row[4] = o.bone || 0; row[5] = o.na || 0; row[6] = o.nf || 0;
+    row[7] = c[0]; row[8] = c[1]; row[9] = c[2];
+    for (let i = 0; i < 9; i++) row[10 + i] = Rt[i];
+    row[19] = 1 / s[0]; row[20] = 1 / s[1]; row[21] = 1 / s[2]; row[22] = Math.min(s[0], s[1], s[2]);
+    for (let i = 0; i < par.length; i++) row[23 + i] = par[i];
+    row[31] = ident ? 1 : 0;
+    for (let i = 0; i < PS; i++) this.d.push(row[i]);
+    // bounding sphere in world space
+    const lc = lr.c || [0, 0, 0], wc = vadd(m3v(Rm, [lc[0] * s[0], lc[1] * s[1], lc[2] * s[2]]), c);
+    this.bs.push(wc[0], wc[1], wc[2], lr.r * Math.max(s[0], s[1], s[2]) + (o.k || 0) + (o.na || 0));
+    this.n++;
+    return this;
+  }
+  sphere(c, r, o) { return this._add(T_SPHERE, [r], { r }, Object.assign({ c }, o)); }
+  ell(c, s, o) { return this._add(T_SPHERE, [1], { r: 1 }, Object.assign({ c, s }, o)); }
+  caps(a, b, ra, rb, o) {
+    return this._add(T_CAPS, [a[0], a[1], a[2], b[0], b[1], b[2], ra, rb],
+      { c: vmul(vadd(a, b), 0.5), r: vlen(vsub(b, a)) / 2 + Math.max(ra, rb) }, o);
+  }
+  box(c, h, rd, o) { return this._add(T_BOX, [h[0], h[1], h[2], rd], { r: vlen(h) + rd }, Object.assign({ c }, o)); }
+  torus(c, R0, r, o) { return this._add(T_TORUS, [R0, r], { r: R0 + r }, Object.assign({ c }, o)); }
+  cyl(c, h, r1, r2, rd, o) { return this._add(T_CYL, [h, r1, r2, rd], { r: Math.hypot(h, Math.max(r1, r2)) + rd }, Object.assign({ c }, o)); }
+  flat() { return new Float64Array(this.d); }
+}
+
+// evaluation scratch state for "rich" queries
+const SD = { mat: 0, boneD: new Float64Array(16) };
+
+function sdEval(D, list, n, x, y, z, rich) {
+  let d = 1e9;
+  if (rich) { SD.mat = 0; SD.boneD.fill(1e9); }
+  for (let q = 0; q < n; q++) {
+    const o = list[q] * PS;
+    let px = x - D[o + 7], py = y - D[o + 8], pz = z - D[o + 9];
+    if (D[o + 31] !== 1) {
+      const a = px, b = py, c = pz;
+      px = D[o + 10] * a + D[o + 11] * b + D[o + 12] * c;
+      py = D[o + 13] * a + D[o + 14] * b + D[o + 15] * c;
+      pz = D[o + 16] * a + D[o + 17] * b + D[o + 18] * c;
+    }
+    px *= D[o + 19]; py *= D[o + 20]; pz *= D[o + 21];
+    let dp;
+    switch (D[o]) {
+      case T_SPHERE: dp = Math.sqrt(px * px + py * py + pz * pz) - D[o + 23]; break;
+      case T_CAPS: {
+        const ax = D[o + 23], ay = D[o + 24], az = D[o + 25], bx = D[o + 26] - ax, by = D[o + 27] - ay, bz = D[o + 28] - az;
+        const qx = px - ax, qy = py - ay, qz = pz - az;
+        let h = (qx * bx + qy * by + qz * bz) / (bx * bx + by * by + bz * bz);
+        h = h < 0 ? 0 : h > 1 ? 1 : h;
+        const ex = qx - bx * h, ey = qy - by * h, ez = qz - bz * h;
+        dp = Math.sqrt(ex * ex + ey * ey + ez * ez) - (D[o + 29] + (D[o + 30] - D[o + 29]) * h);
+        break;
+      }
+      case T_BOX: {
+        const r = D[o + 26];
+        const qx = Math.abs(px) - D[o + 23] + r, qy = Math.abs(py) - D[o + 24] + r, qz = Math.abs(pz) - D[o + 25] + r;
+        const ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0, oz = qz > 0 ? qz : 0;
+        const mx = qx > qy ? (qx > qz ? qx : qz) : (qy > qz ? qy : qz);
+        dp = Math.sqrt(ox * ox + oy * oy + oz * oz) + (mx < 0 ? mx : 0) - r;
+        break;
+      }
+      case T_TORUS: {
+        const qx = Math.sqrt(px * px + pz * pz) - D[o + 23];
+        dp = Math.sqrt(qx * qx + py * py) - D[o + 24];
+        break;
+      }
+      default: {                           // capped cone along local y
+        const h = D[o + 23], rd = D[o + 26];
+        let t = (py + h) / (2 * h); t = t < 0 ? 0 : t > 1 ? 1 : t;
+        const qx = Math.sqrt(px * px + pz * pz) - (D[o + 24] + (D[o + 25] - D[o + 24]) * t) + rd, qy = Math.abs(py) - h + rd;
+        const ox = qx > 0 ? qx : 0, oy = qy > 0 ? qy : 0, mx = qx > qy ? qx : qy;
+        dp = Math.sqrt(ox * ox + oy * oy) + (mx < 0 ? mx : 0) - rd;
+      }
+    }
+    dp *= D[o + 22];
+    if (D[o + 5] !== 0 && dp < 0.04) { const f = D[o + 6]; dp += D[o + 5] * 2 * noise3(x * f, y * f, z * f); }
+    const k = D[o + 1];
+    if (D[o + 2] === 0) {                  // smooth union
+      if (rich) {
+        if (dp < d) SD.mat = D[o + 3];
+        const b = D[o + 4];
+        if (dp < SD.boneD[b]) SD.boneD[b] = dp;
+      }
+      if (k > 0) { const h = Math.max(k - Math.abs(d - dp), 0) / k; d = Math.min(d, dp) - h * h * k * 0.25; }
+      else if (dp < d) d = dp;
+    } else {                               // smooth subtraction (carving)
+      const nd = -dp;
+      if (k > 0) { const h = Math.max(k - Math.abs(d - nd), 0) / k; d = Math.max(d, nd) + h * h * k * 0.25; }
+      else if (nd > d) d = nd;
+    }
+  }
+  return d;
+}
+
+// Turn a sculpt into a mesh (surface nets on a sparse grid). Returns skinned vertices (22 floats each).
+function polygonize(sc, bmin, bmax, h, bn, mats, rigidBone) {
+  const D = sc.flat(), np = sc.n, B = h * bn;
+  const bx = Math.max(1, Math.ceil((bmax[0] - bmin[0]) / B)), by = Math.max(1, Math.ceil((bmax[1] - bmin[1]) / B)), bz = Math.max(1, Math.ceil((bmax[2] - bmin[2]) / B));
+  const nx = bx * bn + 1, ny = by * bn + 1, nz = bz * bn + 1, nb = bx * by * bz;
+  const reach = B * 0.87 + 0.035;
+
+  // which primitives can matter inside each block
+  const lists = new Array(nb);
+  for (let i = 0; i < nb; i++) lists[i] = [];
+  for (let p = 0; p < np; p++) {
+    const cx = sc.bs[p * 4], cy = sc.bs[p * 4 + 1], cz = sc.bs[p * 4 + 2], rr = sc.bs[p * 4 + 3] + reach;
+    const i0 = Math.max(0, Math.floor((cx - rr - bmin[0]) / B)), i1 = Math.min(bx - 1, Math.floor((cx + rr - bmin[0]) / B));
+    const j0 = Math.max(0, Math.floor((cy - rr - bmin[1]) / B)), j1 = Math.min(by - 1, Math.floor((cy + rr - bmin[1]) / B));
+    const k0 = Math.max(0, Math.floor((cz - rr - bmin[2]) / B)), k1 = Math.min(bz - 1, Math.floor((cz + rr - bmin[2]) / B));
+    for (let k = k0; k <= k1; k++) for (let j = j0; j <= j1; j++) for (let i = i0; i <= i1; i++) {
+      const ex = bmin[0] + (i + 0.5) * B - cx, ey = bmin[1] + (j + 0.5) * B - cy, ez = bmin[2] + (k + 0.5) * B - cz;
+      if (ex * ex + ey * ey + ez * ez <= rr * rr) lists[i + bx * (j + by * k)].push(p);
+    }
+  }
+
+  // sample the field only in blocks the surface passes through
+  const val = new Float32Array(nx * ny * nz).fill(1e3);
+  const marked = new Uint8Array(nb), thresh = B * 0.87 + h * 1.5 + 0.006;
+  for (let k = 0; k < bz; k++) for (let j = 0; j < by; j++) for (let i = 0; i < bx; i++) {
+    const b = i + bx * (j + by * k), L = lists[b];
+    if (!L.length) continue;
+    const dc = sdEval(D, L, L.length, bmin[0] + (i + 0.5) * B, bmin[1] + (j + 0.5) * B, bmin[2] + (k + 0.5) * B, false);
+    const i1 = i === bx - 1 ? bn : bn - 1, j1 = j === by - 1 ? bn : bn - 1, k1 = k === bz - 1 ? bn : bn - 1;
+    if (Math.abs(dc) > thresh) {
+      if (dc < 0) for (let c = 0; c <= k1; c++) for (let b2 = 0; b2 <= j1; b2++) for (let a = 0; a <= i1; a++) val[(i * bn + a) + nx * ((j * bn + b2) + ny * (k * bn + c))] = -1e3;
+      continue;
+    }
+    marked[b] = 1;
+    for (let c = 0; c <= k1; c++) for (let b2 = 0; b2 <= j1; b2++) for (let a = 0; a <= i1; a++) {
+      const gi = i * bn + a, gj = j * bn + b2, gk = k * bn + c;
+      val[gi + nx * (gj + ny * gk)] = sdEval(D, L, L.length, bmin[0] + gi * h, bmin[1] + gj * h, bmin[2] + gk * h, false);
+    }
+  }
+
+  // surface nets: one vertex per cell the surface crosses
+  const cnx = nx - 1, cny = ny - 1, cnz = nz - 1;
+  const cellV = new Int32Array(cnx * cny * cnz).fill(-1);
+  const pos = [], cellBlock = [];
+  const edges = [];
+  for (let a = 0; a < 8; a++) for (let b = a + 1; b < 8; b++) { const x = a ^ b; if (x === 1 || x === 2 || x === 4) edges.push(a, b); }
+  const cd = new Float64Array(8);
+  for (let k = 0; k < bz; k++) for (let j = 0; j < by; j++) for (let i = 0; i < bx; i++) {
+    const b = i + bx * (j + by * k);
+    if (!marked[b]) continue;
+    for (let c = 0; c < bn; c++) for (let b2 = 0; b2 < bn; b2++) for (let a = 0; a < bn; a++) {
+      const gi = i * bn + a, gj = j * bn + b2, gk = k * bn + c, base = gi + nx * (gj + ny * gk);
+      let mask = 0;
+      for (let q = 0; q < 8; q++) {
+        const v = val[base + (q & 1) + nx * (((q >> 1) & 1) + ny * ((q >> 2) & 1))];
+        cd[q] = v; if (v < 0) mask |= 1 << q;
+      }
+      if (mask === 0 || mask === 255) continue;
+      let sx = 0, sy = 0, sz = 0, cnt = 0;
+      for (let e = 0; e < 24; e += 2) {
+        const qa = edges[e], qb = edges[e + 1], da = cd[qa], db = cd[qb];
+        if ((da < 0) === (db < 0)) continue;
+        const t = da / (da - db);
+        sx += (qa & 1) + ((qb & 1) - (qa & 1)) * t; sy += ((qa >> 1) & 1) + (((qb >> 1) & 1) - ((qa >> 1) & 1)) * t; sz += ((qa >> 2) & 1) + (((qb >> 2) & 1) - ((qa >> 2) & 1)) * t;
+        cnt++;
+      }
+      cellV[gi + cnx * (gj + cny * gk)] = pos.length / 3;
+      pos.push(bmin[0] + (gi + sx / cnt) * h, bmin[1] + (gj + sy / cnt) * h, bmin[2] + (gk + sz / cnt) * h);
+      cellBlock.push(b);
+    }
+  }
+  const nv = pos.length / 3, nor = new Float32Array(nv * 3), idx = [];
+  const emit = (v0, v1, v2, v3, ax, sign) => {
+    if (v0 < 0 || v1 < 0 || v2 < 0 || v3 < 0) return;
+    const ux = pos[v1 * 3] - pos[v0 * 3], uy = pos[v1 * 3 + 1] - pos[v0 * 3 + 1], uz = pos[v1 * 3 + 2] - pos[v0 * 3 + 2];
+    const wx = pos[v3 * 3] - pos[v0 * 3], wy = pos[v3 * 3 + 1] - pos[v0 * 3 + 1], wz = pos[v3 * 3 + 2] - pos[v0 * 3 + 2];
+    const tx = pos[v2 * 3] - pos[v0 * 3], ty = pos[v2 * 3 + 1] - pos[v0 * 3 + 1], tz = pos[v2 * 3 + 2] - pos[v0 * 3 + 2];
+    // two triangles' normals (v0,v1,v2) and (v0,v2,v3)
+    let n = [uy * tz - uz * ty + ty * wz - tz * wy, uz * tx - ux * tz + tz * wx - tx * wz, ux * ty - uy * tx + tx * wy - ty * wx];
+    if ((n[ax] > 0) !== (sign > 0)) n = [-n[0], -n[1], -n[2]];
+    for (const v of [v0, v1, v2, v3]) { nor[v * 3] += n[0]; nor[v * 3 + 1] += n[1]; nor[v * 3 + 2] += n[2]; }
+    idx.push(v0, v1, v2, v0, v2, v3);
+  };
+  const cv = (i, j, k) => cellV[i + cnx * (j + cny * k)];
+  for (let k = 0; k < bz; k++) for (let j = 0; j < by; j++) for (let i = 0; i < bx; i++) {
+    if (!marked[i + bx * (j + by * k)]) continue;
+    for (let c = 0; c < bn; c++) for (let b2 = 0; b2 < bn; b2++) for (let a = 0; a < bn; a++) {
+      const gi = i * bn + a, gj = j * bn + b2, gk = k * bn + c, base = gi + nx * (gj + ny * gk);
+      const d0 = val[base], in0 = d0 < 0;
+      if (gj > 0 && gk > 0 && (val[base + 1] < 0) !== in0) emit(cv(gi, gj - 1, gk - 1), cv(gi, gj, gk - 1), cv(gi, gj, gk), cv(gi, gj - 1, gk), 0, in0 ? 1 : -1);
+      if (gi > 0 && gk > 0 && (val[base + nx] < 0) !== in0) emit(cv(gi - 1, gj, gk - 1), cv(gi, gj, gk - 1), cv(gi, gj, gk), cv(gi - 1, gj, gk), 1, in0 ? 1 : -1);
+      if (gi > 0 && gj > 0 && (val[base + nx * ny] < 0) !== in0) emit(cv(gi - 1, gj - 1, gk), cv(gi, gj - 1, gk), cv(gi, gj, gk), cv(gi - 1, gj, gk), 2, in0 ? 1 : -1);
+    }
+  }
+
+  // per-vertex material, skin weights and ambient occlusion
+  const out = new Float32Array(nv * 22), bw = new Float64Array(16);
+  for (let v = 0; v < nv; v++) {
+    const L = lists[cellBlock[v]];
+    const e = h * 0.5, ev = (a, b, c) => sdEval(D, L, L.length, a, b, c, false);
+    let x = pos[v * 3], y = pos[v * 3 + 1], z = pos[v * 3 + 2];
+    let d0 = ev(x, y, z), gx = ev(x + e, y, z) - d0, gy = ev(x, y + e, z) - d0, gz = ev(x, y, z + e) - d0;
+    let g2 = (gx * gx + gy * gy + gz * gz) / (e * e);
+    if (g2 > 1e-6) {                       // one Newton step onto the surface
+      const st = clamp(d0 / g2 / e, -h * 0.9 / (Math.sqrt(g2) * e), h * 0.9 / (Math.sqrt(g2) * e));
+      x -= gx * st; y -= gy * st; z -= gz * st;
+      d0 = ev(x, y, z); gx = ev(x + e, y, z) - d0; gy = ev(x, y + e, z) - d0; gz = ev(x, y, z + e) - d0;
+    }
+    let nl = Math.hypot(gx, gy, gz);
+    if (nl < 1e-9) { gx = nor[v * 3]; gy = nor[v * 3 + 1]; gz = nor[v * 3 + 2]; nl = Math.hypot(gx, gy, gz) || 1; }
+    const nxn = gx / nl, nyn = gy / nl, nzn = gz / nl;
+    sdEval(D, L, L.length, x, y, z, true);
+    const m = mats[SD.mat] || mats[0];
+    let dmin = 1e9;
+    for (let b = 0; b < 16; b++) if (SD.boneD[b] < dmin) dmin = SD.boneD[b];
+    for (let b = 0; b < 16; b++) { const t = 1 - (SD.boneD[b] - dmin) / 0.045; bw[b] = t > 0 ? t * t : 0; }
+    let ao = 0;
+    for (const s of [0.015, 0.04, 0.09]) ao += clamp(sdEval(D, L, L.length, x + nxn * s, y + nyn * s, z + nzn * s, false) / s, 0, 1);
+    ao = 0.3 + 0.7 * Math.pow(ao / 3, 0.8);
+    const o = v * 22;
+    out[o] = x; out[o + 1] = y; out[o + 2] = z; out[o + 3] = nxn; out[o + 4] = nyn; out[o + 5] = nzn;
+    out[o + 6] = m.c[0]; out[o + 7] = m.c[1]; out[o + 8] = m.c[2]; out[o + 9] = ao;
+    out[o + 10] = m.r; out[o + 11] = m.m; out[o + 12] = m.p; out[o + 13] = 0;
+    if (rigidBone !== undefined) { out[o + 14] = rigidBone; out[o + 18] = 1; }
+    else {
+      let tot = 0;
+      for (let q = 0; q < 4; q++) {
+        let best = 0;
+        for (let b = 1; b < 16; b++) if (bw[b] > bw[best]) best = b;
+        out[o + 14 + q] = best; out[o + 18 + q] = bw[best]; tot += bw[best]; bw[best] = 0;
+      }
+      for (let q = 0; q < 4; q++) out[o + 18 + q] /= tot || 1;
+    }
+  }
+  return { verts: out, idx, n: nv };
+}
+
+/* =====================================================================
+   9. CHARACTERS — sculpted models, skeleton, and poses
+      Character space: facing +z, right hand at +x, feet on y = 0.
+   ===================================================================== */
+const BONE = { pelvis: 0, chest: 1, head: 2, armR: 3, foreR: 4, handR: 5, armL: 6, foreL: 7, handL: 8, thighR: 9, shinR: 10, footR: 11, thighL: 12, shinL: 13, footL: 14 };
+const NBONES = 15;
+const mirror = p => [-p[0], p[1], p[2]];
+const ARMD = [0.616, -0.788, 0];               // bind pose: arms held out and down ("A" pose)
+const UARM = 0.28, FARM = 0.26, THIGH = 0.43, SHIN = 0.41, SPINE = 0.36;
+const BJ = (() => {                            // bind-pose joints
+  const j = { hips: [0, 0.95, 0], waist: [0, 1.12, 0], neck: [0, 1.48, 0], shR: [0.186, 1.43, 0], hipR: [0.095, 0.93, 0], knR: [0.105, 0.5, 0], anR: [0.105, 0.09, 0] };
+  j.elR = vadd(j.shR, vmul(ARMD, UARM)); j.wrR = vadd(j.elR, vmul(ARMD, FARM));
+  for (const k of ['sh', 'el', 'wr', 'hip', 'kn', 'an']) j[k + 'L'] = mirror(j[k + 'R']);
+  return j;
+})();
+// hand frames in the bind pose: columns = thumb side, finger direction, back of the hand
+const HANDF = { 1: m3cols([0, 0, 1], ARMD, [0.788, 0.616, 0]), '-1': m3cols([0, 0, 1], mirror(ARMD), [-0.788, 0.616, 0]) };
+// where the revolver sits: in the gun hand, and in the holster on the right hip
+const GUN_HAND = xfMul({ R: HANDF[1], t: BJ.wrR }, { R: m3cols([0, 0, 1], [1, 0, 0], [0, 1, 0]), t: [0.004, 0.06, -0.03] });
+const GUN_HOLSTER = (() => { const zg = vnorm([0, -0.97, 0.22]), yg = vnorm([0, -0.22, -0.97]); return { R: m3cols(vcross(yg, zg), yg, zg), t: [0.232, 0.975, -0.03] }; })();
+
+function charMats(p) {
+  const m = (c, r, me, pt) => ({ c: lin(c), r, m: me || 0, p: pt || 0 });
+  return [
+    m(p.coat, p.leather ? 0.6 : 0.92, 0, p.leather ? 8 : 7), m(p.vest, 0.88, 0, 7), m(p.pants, 0.9, 0, 7), m(p.boot, 0.5, 0, 8), m(p.belt, 0.55, 0, 8),
+    m([214, 170, 86], 0.3, 1), m(p.bandana, 0.85, 0, 7), m(p.skin, 0.74), m(p.hair, 0.75, 0, 7), m(p.hat, 0.96, 0, 7),
+    m(p.band, 0.55, 0, 8), m([92, 94, 104], 0.3, 1), m([104, 58, 32], 0.45, 0, 8), m([22, 16, 13], 0.8), m([18, 14, 12], 0.25), m(p.shirt, 0.9, 0, 7),
+  ];
+}
+const MT = { coat: 0, vest: 1, pants: 2, boot: 3, belt: 4, brass: 5, bandana: 6, skin: 7, hair: 8, hat: 9, band: 10, steel: 11, grip: 12, sole: 13, eye: 14, shirt: 15 };
+
+function sculptBody(o) {
+  const sc = new Sculpt(), B = BONE;
+  const coat = { mat: MT.coat, k: 0.035, na: 0.0022, nf: 11 };
+  const slv = o.shirtSleeves ? { mat: MT.shirt, k: 0.03, na: 0.0024, nf: 13 } : coat;
+  // ---- coat first, so it can be carved open before the body goes in ----
+  sc.ell([0, 1.3, 0], [0.184, 0.185, 0.128], Object.assign({ bone: B.chest }, coat));
+  sc.ell([0, 1.1, 0.004], [0.166, 0.19, 0.122], Object.assign({ bone: B.chest }, coat));
+  sc.caps([-0.128, 1.418, -0.006], [0.128, 1.418, -0.006], 0.064, 0.064, Object.assign({ bone: B.chest, s: [1, 1, 0.9] }, coat));
+  for (const sd of [1, -1]) {
+    const J = k => (sd > 0 ? BJ[k + 'R'] : BJ[k + 'L']), up = sd > 0 ? B.armR : B.armL, fo = sd > 0 ? B.foreR : B.foreL;
+    sc.caps(J('sh'), J('el'), 0.06, 0.05, Object.assign({ bone: up }, slv));
+    sc.caps(J('el'), vlerp(J('el'), J('wr'), 0.92), 0.05, 0.042, Object.assign({ bone: fo }, slv));
+    sc.caps(vlerp(J('el'), J('wr'), 0.87), vlerp(J('el'), J('wr'), 0.97), 0.046, 0.046, { mat: slv.mat, k: 0.006, bone: fo });
+  }
+  if (o.long) {
+    sc.cyl([0, 0.72, 0], 0.32, 1.0, 0.66, 0.03, Object.assign({ s: [0.245, 1, 0.19], bone: B.pelvis }, coat, { k: 0.05, na: 0.004, nf: 8 }));
+  } else {
+    sc.cyl([0, 0.975, 0], 0.1, 1.0, 0.95, 0.03, Object.assign({ s: [0.182, 1, 0.136], bone: B.pelvis }, coat, { k: 0.04 }));
+  }
+  sc.torus([0, 1.472, -0.008], 0.062, 0.017, { mat: slv.mat, k: 0.02, bone: B.chest, s: [1, 1.5, 1] });      // upturned collar
+  sc.caps([0, 1.46, 0.095], [0, o.long ? 0.38 : 0.84, o.long ? 0.19 : 0.13], 0.03, o.long ? 0.12 : 0.065, { sub: true, k: 0.015 });   // open front
+  if (o.shirtSleeves) {                                                                        // waistcoat: back strap, yoke seam
+    sc.box([0, 1.36, -0.118], [0.15, 0.006, 0.012], 0.005, { mat: MT.coat, k: 0.012, bone: B.chest });
+    sc.box([0, 1.1, -0.122], [0.075, 0.016, 0.008], 0.005, { mat: MT.belt, k: 0.004, bone: B.chest });
+    sc.box([0, 1.1, -0.131], [0.016, 0.02, 0.004], 0.003, { mat: MT.brass, k: 0.002, bone: B.chest });
+  }
+  if (o.long) {
+    sc.caps([0.13, 1.03, 0.12], [0.24, 0.38, 0.19], 0.05, 0.16, { sub: true, k: 0.02 });         // swept back off the holster
+    sc.box([0, 0.58, -0.2], [0.012, 0.19, 0.07], 0.004, { sub: true, k: 0.012 });                // back vent
+  }
+  // ---- body ----
+  sc.ell([0, 1.295, 0.002], [0.158, 0.175, 0.11], { mat: MT.vest, k: 0.03, bone: B.chest });
+  sc.ell([0, 1.1, 0.004], [0.142, 0.18, 0.102], { mat: MT.vest, k: 0.03, bone: B.chest });
+  sc.caps([0, 1.42, 0.08], [0, 1.22, 0.104], 0.03, 0.02, { mat: MT.shirt, k: 0.01, bone: B.chest, s: [1, 1, 0.5] });   // shirt front
+  const pn = { mat: MT.pants, k: 0.03, na: 0.003, nf: 18 };
+  sc.ell([0, 0.96, 0], [0.158, 0.118, 0.108], Object.assign({ bone: B.pelvis }, pn));
+  for (const sd of [1, -1]) {
+    const J = k => (sd > 0 ? BJ[k + 'R'] : BJ[k + 'L']), x = sd * 0.105;
+    const th = sd > 0 ? B.thighR : B.thighL, sh = sd > 0 ? B.shinR : B.shinL, ft = sd > 0 ? B.footR : B.footL;
+    sc.caps(J('hip'), J('kn'), 0.089, 0.067, Object.assign({ bone: th }, pn));
+    sc.caps(J('kn'), [x, 0.3, 0], 0.066, 0.055, Object.assign({ bone: sh }, pn));
+    sc.caps([x, 0.42, 0], [x, 0.1, 0], 0.069, 0.058, { mat: MT.boot, k: 0.008, bone: sh });
+    sc.torus([x, 0.425, 0], 0.066, 0.008, { mat: MT.boot, k: 0.004, bone: sh });
+    sc.caps([x, 0.052, -0.04], [x, 0.044, 0.15], 0.048, 0.04, { mat: MT.boot, k: 0.02, bone: ft });
+    sc.box([x, 0.012, 0.055], [0.046, 0.012, 0.13], 0.01, { mat: MT.sole, k: 0.004, bone: ft });
+    sc.box([x, 0.024, -0.052], [0.04, 0.024, 0.036], 0.008, { mat: MT.sole, k: 0.004, bone: ft });
+    sc.sphere([x, 0.07, -0.1], 0.014, { mat: MT.brass, bone: ft });                               // spur
+  }
+  if (o.bandana) {
+    sc.ell([0, 1.475, 0.035], [0.084, 0.046, 0.072], { mat: MT.bandana, k: 0.02, bone: B.chest });
+    sc.caps([0, 1.46, 0.1], [0, 1.375, 0.118], 0.036, 0.012, { mat: MT.bandana, k: 0.02, bone: B.chest });
+  } else {
+    sc.torus([0, 1.478, 0], 0.058, 0.02, { mat: MT.bandana, k: 0.008, bone: B.chest });
+    sc.caps([0.005, 1.485, -0.08], [0.03, 1.43, -0.105], 0.017, 0.008, { mat: MT.bandana, k: 0.008, bone: B.chest });
+    sc.caps([-0.005, 1.485, -0.08], [-0.022, 1.44, -0.11], 0.017, 0.008, { mat: MT.bandana, k: 0.008, bone: B.chest });
+  }
+  return sc;
+}
+
+function sculptHead(o) {
+  const sc = new Sculpt(), sk = { mat: MT.skin, bone: BONE.head };
+  sc.caps([0, 1.43, -0.008], [0, 1.57, 0.004], 0.047, 0.045, Object.assign({ k: 0.02 }, sk));
+  sc.ell([0, 1.658, -0.006], [0.081, 0.097, 0.097], Object.assign({ k: 0.03 }, sk));
+  sc.ell([0, 1.602, 0.03], [0.068, 0.084, 0.075], Object.assign({ k: 0.03 }, sk));
+  sc.sphere([0, 1.547, 0.066], 0.03, Object.assign({ k: 0.025 }, sk));
+  for (const s of [1, -1]) {
+    sc.sphere([s * 0.048, 1.615, 0.066], 0.026, Object.assign({ k: 0.03 }, sk));               // cheekbone
+    sc.ell([s * 0.084, 1.636, -0.002], [0.011, 0.03, 0.018], Object.assign({ k: 0.008 }, sk));  // ear
+    sc.caps([s * 0.045, 1.57, 0.03], [s * 0.012, 1.538, 0.07], 0.022, 0.02, Object.assign({ k: 0.02 }, sk));   // jawline
+  }
+  sc.caps([-0.04, 1.662, 0.086], [0.04, 1.662, 0.086], 0.014, 0.014, Object.assign({ k: 0.016 }, sk));   // brow
+  sc.caps([0, 1.648, 0.094], [0, 1.612, 0.119], 0.011, 0.016, Object.assign({ k: 0.012 }, sk));           // nose
+  for (const s of [1, -1]) sc.sphere([s * 0.033, 1.645, 0.103], 0.016, { sub: true, k: 0.012 });          // eye sockets
+  for (const s of [1, -1]) sc.sphere([s * 0.033, 1.643, 0.086], 0.012, { mat: MT.eye, bone: BONE.head });
+  sc.caps([-0.02, 1.577, 0.097], [0.02, 1.577, 0.097], 0.006, 0.006, Object.assign({ k: 0.006 }, sk));    // lips
+  const hr = { mat: MT.hair, bone: BONE.head, k: 0.012, na: 0.004, nf: 60 };
+  sc.ell([0, 1.648, -0.03], [0.088, 0.092, 0.09], hr);
+  sc.ell([0, 1.575, -0.055], [0.066, 0.05, 0.05], hr);
+  for (const s of [1, -1]) sc.caps([s * 0.078, 1.66, 0.03], [s * 0.074, 1.6, 0.036], 0.012, 0.008, hr);   // sideburns
+  if (o.mustache) for (const s of [1, -1]) sc.caps([s * 0.004, 1.593, 0.104], [s * 0.046, 1.574, 0.086], 0.012, 0.006, hr);
+  return sc;
+}
+
+function sculptHat() {
+  const sc = new Sculpt(), ht = { mat: MT.hat, bone: BONE.head, k: 0.014 };
+  const tilt = rotX(-0.1);
+  sc.cyl([0, 1.712, 0.006], 0.0055, 1, 1, 0.005, Object.assign({ s: [0.198, 1, 0.215], R: tilt }, ht));    // brim
+  sc.cyl([0, 1.79, 0], 0.075, 1, 0.84, 0.03, Object.assign({ s: [0.096, 1, 0.11] }, ht, { k: 0.02 }));     // crown
+  sc.caps([0, 1.885, -0.07], [0, 1.88, 0.08], 0.03, 0.026, { sub: true, k: 0.03 });                       // centre crease
+  for (const s of [1, -1]) sc.sphere([s * 0.092, 1.845, 0.07], 0.036, { sub: true, k: 0.03 });             // front pinch
+  sc.cyl([0, 1.73, 0], 0.013, 1, 0.985, 0.003, { s: [0.099, 1, 0.113], mat: MT.band, bone: BONE.head, k: 0.003 });
+  return sc;
+}
+
+// hands are sculpted in a hand frame (x: thumb side, y: toward the fingers, z: back of the hand)
+function sculptHand(side, grip) {
+  const sc = new Sculpt(), sk = { mat: MT.skin, bone: side > 0 ? BONE.handR : BONE.handL, k: 0.006 };
+  sc.group(HANDF[side], side > 0 ? BJ.wrR : BJ.wrL);
+  sc.caps([0, -0.06, 0], [0, 0.012, 0], 0.024, 0.026, Object.assign({ s: [1.25, 1, 1] }, sk));
+  sc.box([0, 0.05, 0], [0.04, 0.046, 0.013], 0.012, sk);
+  const curl = grip ? [1.25, 1.55, 1.2] : [0.4, 0.6, 0.55], len = [0.042, 0.027, 0.021];
+  for (let f = 0; f < 4; f++) {
+    const x = 0.03 - f * 0.02, sc1 = f === 0 || f === 3 ? 0.9 : 1, ext = grip && f === 0 ? 0.55 : 1;
+    let p = [x, 0.094, -0.002], a = 0;
+    for (let s = 0; s < 3; s++) {
+      a += curl[s] * ext;
+      const q = [p[0], p[1] + Math.cos(a) * len[s] * sc1, p[2] - Math.sin(a) * len[s] * sc1];
+      sc.caps(p, q, 0.0098 - s * 0.0009, 0.009 - s * 0.0009, sk);
+      p = q;
+    }
+  }
+  const t0 = [0.036, 0.025, -0.006], t1 = grip ? [0.05, 0.062, -0.03] : [0.062, 0.058, -0.02], t2 = grip ? [0.038, 0.095, -0.05] : [0.068, 0.09, -0.032];
+  sc.caps(t0, t1, 0.0125, 0.011, sk); sc.caps(t1, t2, 0.0105, 0.009, sk);
+  sc.group(null, null);
+  return sc;
+}
+
+// revolver, in its own space: barrel along +z, top strap +y, origin at the middle of the grip
+function sculptGun() {
+  const sc = new Sculpt(), st = { mat: MT.steel, k: 0.003 }, ax = rotX(Math.PI / 2);
+  sc.caps([0, 0.03, 0.012], [0, -0.058, -0.024], 0.0125, 0.016, { mat: MT.grip, k: 0.004, s: [0.72, 1, 1] });
+  sc.sphere([0, -0.066, -0.027], 0.012, { mat: MT.steel, k: 0.002, s: [0.75, 0.5, 1.2] });
+  sc.box([0, 0.053, 0.04], [0.0075, 0.021, 0.036], 0.003, st);
+  sc.cyl([0, 0.058, 0.046], 0.021, 0.0188, 0.0188, 0.002, Object.assign({ R: ax }, st));
+  for (let i = 0; i < 6; i++) { const a = i / 6 * TAU + 0.5; sc.caps([Math.cos(a) * 0.0195, 0.058 + Math.sin(a) * 0.0195, 0.036], [Math.cos(a) * 0.0195, 0.058 + Math.sin(a) * 0.0195, 0.07], 0.0045, 0.0045, { sub: true, k: 0.002 }); }
+  sc.cyl([0, 0.065, 0.137], 0.07, 0.0082, 0.0076, 0.001, Object.assign({ R: ax }, st));
+  sc.caps([0, 0.05, 0.07], [0, 0.05, 0.165], 0.0048, 0.0048, st);
+  sc.box([0, 0.0765, 0.198], [0.002, 0.0045, 0.006], 0.001, st);
+  sc.caps([0, 0.07, 0.002], [0, 0.09, -0.014], 0.0042, 0.0034, st);
+  sc.torus([0, 0.026, 0.046], 0.0135, 0.003, Object.assign({ R: rotZ(Math.PI / 2) }, st));
+  sc.caps([0, 0.035, 0.044], [0, 0.021, 0.049], 0.0028, 0.0024, st);
+  return sc;
+}
+
+// gun belt: leather strap, buckle, holster and (for the hero) cartridge loops
+function sculptBelt(o) {
+  const sc = new Sculpt(), rx = o.rx, rz = o.rz, n = 30, lt = { mat: MT.belt, bone: BONE.pelvis, k: 0.004 };
+  const pt = a => [Math.sin(a) * rx, 0.985 - o.slant * Math.sin(a), Math.cos(a) * rz];
+  for (let i = 0; i < n; i++) {
+    const a0 = i / n * TAU, a1 = (i + 1) / n * TAU, p0 = pt(a0), p1 = pt(a1), mid = vmul(vadd(p0, p1), 0.5), d = vsub(p1, p0);
+    sc.box(mid, [vlen(d) * 0.62, 0.022, 0.0055], 0.004, Object.assign({ R: rotY(Math.atan2(-d[2], d[0])) }, lt));
+    if (o.cartridges && Math.cos((a0 + a1) / 2) < 0.25) {
+      const out = vnorm([mid[0] / (rx * rx), 0, mid[2] / (rz * rz)]), c = vadd(mid, vmul(out, 0.011));
+      sc.caps([c[0], c[1] - 0.017, c[2]], [c[0], c[1] + 0.02, c[2]], 0.0068, 0.0058, { mat: MT.brass, bone: BONE.pelvis, k: 0.001 });
+    }
+  }
+  sc.box([0, 0.985, rz + 0.006], [0.026, 0.021, 0.005], 0.004, { mat: MT.brass, bone: BONE.pelvis, k: 0.002 });
+  const hx = rx + 0.02, hy = 0.985 - o.slant;
+  sc.caps([hx, hy - 0.035, -0.006], [hx + 0.006, hy - 0.24, 0.045], 0.037, 0.024, Object.assign({ s: [0.78, 1, 1] }, lt, { k: 0.012 }));
+  sc.caps([hx, hy + 0.01, -0.006], [hx, hy - 0.06, -0.002], 0.03, 0.036, Object.assign({ s: [0.6, 1, 1] }, lt, { k: 0.01 }));
+  sc.torus([hx + 0.004, hy - 0.2, 0.036], 0.031, 0.006, Object.assign({ s: [0.8, 1, 1] }, lt));
+  return sc;
+}
+
+let GUN_MESH = null;
+function buildGun() {
+  const m = polygonize(sculptGun(), [-0.03, -0.085, -0.05], [0.03, 0.1, 0.215], 0.002, 6, charMats(PALETTES.opp), 0);
+  GUN_MESH = mkMesh('skin', m.verts, new Uint32Array(m.idx));
+}
+
+const PALETTES = {
+  opp: { coat: [44, 34, 30], vest: [104, 44, 34], shirt: [196, 182, 152], pants: [58, 50, 46], boot: [34, 24, 20], belt: [96, 60, 34], bandana: [156, 38, 30], skin: [198, 142, 106], hair: [36, 26, 20], hat: [30, 24, 22], band: [120, 42, 30] },
+  player: { leather: true, coat: [96, 62, 38], vest: [150, 126, 92], shirt: [158, 142, 114], pants: [60, 66, 82], boot: [58, 38, 26], belt: [92, 56, 30], bandana: [46, 78, 104], skin: [188, 136, 100], hair: [70, 48, 32], hat: [164, 128, 88], band: [48, 32, 24] },
+};
+
+// q: quality multiplier for voxel size (1 = hero detail)
+function buildCharacter(o) {
+  const mats = charMats(o.pal), V = [], I = [], parts = {};
+  let nv = 0;
+  const add = (name, sc, lo, hi, h, bn, rigid) => {
+    const m = polygonize(sc, lo, hi, h, bn, mats, rigid);
+    parts[name] = { start: I.length, count: m.idx.length };
+    for (let i = 0; i < m.idx.length; i++) I.push(m.idx[i] + nv);
+    V.push(m.verts); nv += m.n;
+  };
+  const q = o.q * CONFIG.gfx.detail;
+  add('body', sculptBody(o), [-0.72, -0.01, -0.31], [0.72, 1.58, 0.31], 0.008 * q, 5);
+  add('head', sculptHead(o), [-0.12, 1.4, -0.14], [0.12, 1.78, 0.15], 0.005 * Math.max(1, q), 5, BONE.head);
+  add('hat', sculptHat(), [-0.26, 1.67, -0.27], [0.26, 1.92, 0.27], 0.005 * Math.max(1, q), 5, BONE.head);
+  add('belt', sculptBelt(o.belt), [-0.3, 0.62, -0.24], [0.33, 1.08, 0.24], (o.belt.cartridges ? 0.0032 : 0.006), 5, BONE.pelvis);
+  const hb = (c, r) => [[c[0] - r, c[1] - r, c[2] - r], [c[0] + r, c[1] + r, c[2] + r]];
+  const hc = vadd(BJ.wrR, vmul(ARMD, 0.06)), hl = mirror(hc), hh = 0.003 * (q > 1.2 ? 1.5 : 1);
+  add('handR', sculptHand(1, false), hb(hc, 0.14)[0], hb(hc, 0.14)[1], hh, 5, BONE.handR);
+  add('gripR', sculptHand(1, true), hb(hc, 0.14)[0], hb(hc, 0.14)[1], hh, 5, BONE.handR);
+  add('handL', sculptHand(-1, false), hb(hl, 0.14)[0], hb(hl, 0.14)[1], hh, 5, BONE.handL);
+  let tot = 0; for (const a of V) tot += a.length;
+  const all = new Float32Array(tot); let off = 0;
+  for (const a of V) { all.set(a, off); off += a.length; }
+  const holster = { R: GUN_HOLSTER.R, t: [o.belt.rx + 0.026, 0.975 - o.belt.slant, -0.03] };
+  return { mesh: mkMesh('skin', all, new Uint32Array(I)), parts, tris: I.length / 3, holster };
+}
+
+/* ---- skeleton: joint positions in, one rigid transform per bone out ---- */
+function ik2(a, target, l1, l2, pole) {
+  let d = vsub(target, a), dist = vlen(d);
+  const dn = vmul(d, 1 / (dist || 1));
+  dist = clamp(dist, Math.abs(l1 - l2) + 0.01, l1 + l2 - 0.004);
+  const x = (l1 * l1 - l2 * l2 + dist * dist) / (2 * dist), hgt = Math.sqrt(Math.max(l1 * l1 - x * x, 0));
+  let pp = vsub(pole, vmul(dn, vdot(pole, dn)));
+  if (vlen(pp) < 1e-4) pp = [0, 0, -1];
+  pp = vnorm(pp);
+  return { mid: vadd(a, vadd(vmul(dn, x), vmul(pp, hgt))), end: vadd(a, vmul(dn, dist)) };
+}
+
+function solveRig(s) {
+  const bones = new Array(NBONES), J = {};
+  const set = (i, Rm, jp, jb) => { bones[i] = { R: Rm, t: vsub(jp, m3v(Rm, jb)) }; };
+  const Rp = s.pelvisR || I3, hips = s.hips;
+  set(BONE.pelvis, Rp, hips, BJ.hips);
+  const waist = vadd(hips, m3v(Rp, vsub(BJ.waist, BJ.hips)));
+  const cdir = vnorm(s.chestDir || m3v(Rp, [0, 1, 0]));
+  let Rc = m3mul(m3fromTo(m3v(Rp, [0, 1, 0]), cdir), Rp);
+  if (s.chestTwist) Rc = m3mul(m3axis(cdir, s.chestTwist), Rc);
+  set(BONE.chest, Rc, waist, BJ.waist);
+  const neck = vadd(waist, vmul(cdir, SPINE)), hdir = vnorm(s.headDir || cdir);
+  let Rh = m3mul(m3fromTo(m3v(Rc, [0, 1, 0]), hdir), Rc);
+  if (s.headYaw) Rh = m3mul(m3axis(hdir, s.headYaw), Rh);
+  set(BONE.head, Rh, neck, BJ.neck);
+  Object.assign(J, { hips, waist, neck, top: vadd(neck, vmul(hdir, 0.27)) });
+  for (const sd of [1, -1]) {
+    const T = sd > 0 ? 'R' : 'L', ad = sd > 0 ? ARMD : mirror(ARMD);
+    const sh = vadd(waist, m3v(Rc, vsub(BJ['sh' + T], BJ.waist)));
+    const r = ik2(sh, s['wr' + T], UARM, FARM, s['pole' + T] || [sd * 0.5, 0, -1]);
+    const Ru = m3mul(m3fromTo(m3v(Rc, ad), vnorm(vsub(r.mid, sh))), Rc);
+    const Rf = m3mul(m3fromTo(m3v(Ru, ad), vnorm(vsub(r.end, r.mid))), Ru);
+    const fr = s['frame' + T];
+    let Rhd;
+    if (fr) Rhd = m3mul(m3cols(fr[0], fr[1], fr[2]), m3T(HANDF[sd]));
+    else Rhd = m3mul(m3fromTo(m3v(Rf, ad), vnorm(s['hdir' + T] || vsub(r.end, r.mid))), Rf);
+    set(sd > 0 ? BONE.armR : BONE.armL, Ru, sh, BJ['sh' + T]);
+    set(sd > 0 ? BONE.foreR : BONE.foreL, Rf, r.mid, BJ['el' + T]);
+    set(sd > 0 ? BONE.handR : BONE.handL, Rhd, r.end, BJ['wr' + T]);
+    J['sh' + T] = sh; J['el' + T] = r.mid; J['wr' + T] = r.end;
+    J['hand' + T] = vadd(r.end, m3v(Rhd, vmul(ad, 0.08)));
+    const hip = vadd(hips, m3v(Rp, vsub(BJ['hip' + T], BJ.hips)));
+    const l = ik2(hip, s['an' + T], THIGH, SHIN, s.kneePole || [0, 0, 1]);
+    const ta = vnorm(vsub(BJ['kn' + T], BJ['hip' + T])), sa = vnorm(vsub(BJ['an' + T], BJ['kn' + T]));
+    const Rt = m3mul(m3fromTo(m3v(Rp, ta), vnorm(vsub(l.mid, hip))), Rp);
+    const Rs = m3mul(m3fromTo(m3v(Rt, sa), vnorm(vsub(l.end, l.mid))), Rt);
+    set(sd > 0 ? BONE.thighR : BONE.thighL, Rt, hip, BJ['hip' + T]);
+    set(sd > 0 ? BONE.shinR : BONE.shinL, Rs, l.mid, BJ['kn' + T]);
+    set(sd > 0 ? BONE.footR : BONE.footL, s['foot' + T] || rotY(sd * 0.22), l.end, BJ['an' + T]);
+    J['hip' + T] = hip; J['kn' + T] = l.mid; J['an' + T] = l.end;
+  }
+  return { bones, J };
+}
+
+// place a solved rig in the world: bone matrices for the shader, joints for hit tests
+function placeRig(rig, xf) {
+  const out = { m: new Float32Array(16 * 16), xf: [], J: {} };
+  for (let i = 0; i < 16; i++) {
+    const w = i < NBONES ? xfMul(xf, rig.bones[i]) : xf;
+    out.xf.push(w); mat4RT(w.R, w.t, out.m, i * 16);
+  }
+  for (const k in rig.J) if (Array.isArray(rig.J[k]) && rig.J[k].length === 3) out.J[k] = xfPoint(xf, rig.J[k]);
+  return out;
+}
+// orthonormal hand frame from a finger direction and an "up" hint
+function handFrame(y, up) {
+  y = vnorm(y);
+  const x = vnorm(vsub(up, vmul(y, vdot(up, y))));
+  return [x, y, vcross(x, y)];
+}
+
+const OPP_XF = { R: rotY(Math.PI), t: OPP_POS }, PLAYER_XF = { R: I3, t: PLAYER_POS };
+let oppRig = null, playerRig = null;
+
+function oppPose() {
+  const o = duel.opp, t = clock;
+  const lean = Math.sin(t * 0.7) * 0.012 + o.stagger * 0.06 * Math.sin(t * 11);
+  const breathe = Math.sin(t * 1.6) * 0.004;
+  const s = {
+    hips: [lean * 0.3, 0.915 - o.stagger * 0.02, 0], chestDir: [lean, 1, 0.03 + breathe * 3 - o.stagger * 0.14],
+    headDir: [lean * 0.4, 1, 0.07], anR: [0.2, 0.09, 0], anL: [-0.2, 0.09, 0], kneePole: [0, 0, 1],
+    wrL: [-0.275 + lean, 0.94, 0.04], poleL: [-0.5, 0, -1], poleR: [0.7, -0.1, -1],
+  };
+  const idle = [0.33, 1.0, 0.04], grip = [0.255, 1.02, -0.01], aim = [0.17, 1.38, 0.43];
+  const d = o.drawP;
+  let wr = idle;
+  if (d > 0) wr = d < 0.4 ? vlerp(idle, grip, smooth(d / 0.4)) : vlerp(grip, aim, easeOut((d - 0.4) / 0.6));
+  if (o.twitchT > 0) {                                  // the tell: his gun hand jumps
+    const a = o.twitchT / CONFIG.opponent.twitchTime;
+    wr = vadd(wr, [0.05 * a + Math.sin(t * 70) * 0.02 * a, 0.045 * a + Math.sin(t * 55) * 0.02 * a, 0.03 * a]);
+  }
+  s.wrR = wr;
+  if (d >= 0.4 && !o.disarmed) {                        // gun in hand: swing it from the holster onto the player
+    const k = easeOut((d - 0.4) / 0.6), tgt = vnorm(vsub([0.25, 1.52, CONFIG.distance - 1], wr));
+    s.frameR = handFrame(vlerp([0, -0.97, 0.22], tgt, k), vlerp([0, -0.22, -0.97], [0, 1, 0], k));
+    s.poleR = vlerp([0.7, -0.1, -1], [0.6, -1, 0], k);
+  } else s.hdirR = [-0.15, -1, 0.2];
+  if (o.disarmed) {                                     // hands up
+    const k = smooth(o.surrenderT / 0.45);
+    s.wrR = vlerp(s.wrR, [0.4, 1.8, 0.08], k); s.wrL = vlerp(s.wrL, [-0.4, 1.8, 0.08], k);
+    s.poleR = [1, -0.3, -0.2]; s.poleL = [-1, -0.3, -0.2]; delete s.frameR; delete s.hdirR;
+  }
+  let xf = OPP_XF;
+  if (o.fall > 0) {                                     // shot: he goes over backwards
+    const e = o.fall * o.fall, k = smooth(o.fall);
+    s.wrR = vlerp(s.wrR, [0.55, 1.3, 0.1], k); s.wrL = vlerp(s.wrL, [-0.55, 1.22, 0.06], k);
+    delete s.frameR;
+    s.headDir = [0, 1, -0.25 * k];
+    s.hips = [s.hips[0], s.hips[1] - 0.05 * Math.sin(Math.min(1, o.fall * 1.4) * Math.PI), 0];
+    const F = { R: m3mul(rotY(o.fallDir * 0.35 * e), m3mul(rotZ(o.fallDir * 0.16 * e), rotX(-1.5 * e))), t: [0, 0.13 * e, -0.08 * e] };
+    xf = xfMul(OPP_XF, F);
+  }
+  return placeRig(solveRig(s), xf);
+}
+
+function playerPose() {
+  const t = rclock, P0 = CONFIG.player;
+  const d = duel.drawn ? smooth(duel.drawnT / P0.drawTime) : 0;
+  const tj = clamp((duel.tremor - CONFIG.sway.base) / (CONFIG.sway.max - CONFIG.sway.base), 0, 1);
+  const sh = (state === 'STARE' || state === 'DRAW') ? 0.3 + tj * 1.7 : 0.2;
+  const jit = [(Math.sin(t * 31) + Math.sin(t * 47 + 1)) * 0.003 * sh, (Math.sin(t * 23 + 2) + Math.sin(t * 53)) * 0.004 * sh, Math.sin(t * 37 + 4) * 0.003 * sh];
+  const br = Math.sin(t * 1.3) * 0.003;
+  const s = {
+    hips: [0, 0.922, 0], chestDir: [0.01, 1, 0.035 + br * 2], headDir: [0.03, 1, 0.04], headYaw: -0.12,
+    anR: [0.17, 0.09, 0.03], anL: [-0.17, 0.09, -0.05], kneePole: [0, 0, 1],
+    wrL: [-0.27, 0.94, 0.03], poleL: [-0.5, 0, -1],
+  };
+  const hover = vadd([0.33, 1.05, -0.035], jit), grip = [0.255, 1.02, -0.045];
+  const rp = reticlePos(), ray = aimRay(rp.x, rp.y);
+  const tgt = vsub(vadd(ray.o, vmul(ray.d, CONFIG.distance / ray.d[2])), PLAYER_POS);
+  const shd = [0.2, 1.4, 0.0], ad = vnorm(vsub(tgt, shd)), aimWr = vadd(shd, vadd(vmul(ad, 0.475), [0.02, 0.0, 0]));
+  let wr = hover;
+  if (d > 0) wr = d < 0.35 ? vlerp(hover, grip, smooth(d / 0.35)) : vlerp(grip, aimWr, easeOut((d - 0.35) / 0.65));
+  s.wrR = wr;
+  if (d >= 0.3) {
+    const k = easeOut((d - 0.3) / 0.7);
+    s.frameR = handFrame(vlerp([0, -0.97, 0.22], vsub(tgt, wr), k * k), vlerp([0, -0.22, -0.97], [0, 1, 0], k));
+    s.poleR = vlerp([0.6, 0.1, -1], [0.55, -1, -0.1], k);
+  } else { s.hdirR = [-0.3, -1, 0.12]; s.poleR = [0.6, 0.1, -1]; }
+  return placeRig(solveRig(s), PLAYER_XF);
+}
+
+function updateRigs() { oppRig = oppPose(); playerRig = playerPose(); }
+// revolver transforms (world): holstered, or in the hand
+const gunXf = (rig, inHand, ch) => xfMul(rig.xf[inHand ? BONE.handR : BONE.pelvis], inHand ? GUN_HAND : ch.holster);
+const oppGunInHand = () => duel.opp.drawP >= 0.4;
+const playerGunInHand = () => duel.drawn && duel.drawnT / CONFIG.player.drawTime > 0.3;
+const muzzleOf = xf => xfPoint(xf, [0, 0.065, 0.21]);
+
+/* =====================================================================
+   10. INPUT
+   ===================================================================== */
+const input = { x: 0, y: 0, down: false, shift: false };
+
+function setMouse(x, y) { input.x = clamp(x, 0, W); input.y = clamp(y, 0, H); }
+function pressDown() {
+  Sfx.init();
+  if (!R.ready) return;
+  input.down = true;
+  const s = STATES[state];
+  if (s.down) s.down();
+}
+function release() {
+  if (!input.down) return;
+  input.down = false;
+  const s = STATES[state];
+  if (s.up) s.up();
+}
+
+hud.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  setMouse(e.clientX, e.clientY);
+  pressDown();
+});
+window.addEventListener('mouseup', e => { if (e.button === 0) release(); });
+window.addEventListener('mousemove', e => {
+  setMouse(e.clientX, e.clientY);
+  if (input.down && !(e.buttons & 1)) release();      // the button came up somewhere we could not see
+});
+hud.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('blur', () => { input.shift = false; release(); });
+
+// basic touch mapping: touch = left button, no focus
+hud.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const t = e.changedTouches[0];
+  setMouse(t.clientX, t.clientY);
+  pressDown();
+}, { passive: false });
+hud.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const t = e.changedTouches[0];
+  setMouse(t.clientX, t.clientY);
+}, { passive: false });
+const touchEnd = e => { e.preventDefault(); if (e.touches.length === 0) release(); };
+hud.addEventListener('touchend', touchEnd, { passive: false });
+hud.addEventListener('touchcancel', touchEnd, { passive: false });
+
+window.addEventListener('keydown', e => {
+  if (e.key === 'Shift') { input.shift = true; return; }
+  if (e.repeat || e.ctrlKey || e.metaKey || e.altKey || !R.ready) return;
+  const k = e.key.toLowerCase();
+  if (k !== 'escape') Sfx.init();
+  if (k === ' ') e.preventDefault();
+  if (k === 'r') restart();
+  else if (k === 'm') Sfx.toggleMute();
+  else if (k === 'escape') toMenu();
+  else { const s = STATES[state]; if (s.key) s.key(k); }
+});
+window.addEventListener('keyup', e => { if (e.key === 'Shift') input.shift = false; });
+window.addEventListener('resize', resize);
+
+/* =====================================================================
+   11. DUEL DATA
+   ===================================================================== */
+const NICK = ['"Rattler"', '"Dusty"', '"Coyote"', '"Deacon"', '"Two-Bit"', '"Copperhead"', '"Lonesome"', '"Flint"', '"Gravel"', '"Sidewinder"'];
+const FIRST = ['Amos', 'Eli', 'Jed', 'Silas', 'Cyrus', 'Hollis', 'Ezra', 'Boone', 'Thaddeus', 'Cal'];
+const LAST = ['Kane', 'Crane', 'Mercer', 'Voss', 'Hargrove', 'Pike', 'Tolliver', 'Reyes', 'Blackwood', 'Dunmore'];
+const pick = a => a[(Math.random() * a.length) | 0];
+
+let duel = null;
+const particles = [], props = [];
+const sway = { x: 0, y: 0, amp: 0, jx: 0, jy: 0, t: rand(0, 100) };
+const fx = { muzzle: 0, seed: 0, hurt: 0, fade: 0, lb: 0, focusK: 0, honorShown: 0.5, honorFlash: 0 };
+
+function newDuel() {
+  duel = {
+    diff: CONFIG.difficulty[store.diff],
+    name: `${pick(NICK)} ${pick(FIRST)} ${pick(LAST)}`,
+    // stare-down
+    ready: false, stareT: 0, delay: rand(CONFIG.stare.minDelay, CONFIG.stare.maxDelay), tremor: CONFIG.sway.base,
+    // draw
+    early: false, earlyT: 0, drawT: 0, drawFlash: 0,
+    // player
+    drawn: false, drawnT: 0, shotsFired: 0, ammo: CONFIG.player.ammo, cooldown: 0, wounds: 0,
+    focus: 1, focusing: false, dead: false, deathT: 0,
+    kick: { x: 0, y: 0 }, off: { x: 0, y: 0 },
+    // opponent
+    opp: {
+      hp: CONFIG.opponent.hp, wounds: 0, dead: false, disarmed: false, hatOff: false,
+      twitchT: 0, drawP: 0, aimT: 0, firstAt: 1, nextAt: 1, shots: 0, stun: 0, stagger: 0,
+      fall: 0, fallDir: 1, landed: false, flashT: 0, flashSeed: 0, surrenderT: 0,
+    },
+    // result
+    outcome: null, resultT: 0, slowmoT: 0, bannerAt: 0, stingPlayed: false,
+  };
+  particles.length = 0; props.length = 0;
+  fx.hurt = 0; fx.muzzle = 0;
+}
+
+function reticlePos() {
+  return {
+    x: clamp(input.x + sway.x + duel.off.x + duel.kick.x, 0, W),
+    y: clamp(input.y + sway.y + duel.off.y + duel.kick.y, 0, H),
+  };
+}
+
+function updateSway(rdt) {
+  let target = duel.tremor * U;
+  if (duel.wounds > 0) target *= CONFIG.sway.woundMult;
+  if (duel.focusing) target *= CONFIG.focus.swayMult;
+  sway.amp += (target - sway.amp) * Math.min(1, rdt * 10);
+  sway.t += rdt;
+  const t = sway.t, A = sway.amp, j = CONFIG.sway.jitter, k = Math.min(1, rdt * 14);
+  sway.jx += (rand(-1, 1) * A * j - sway.jx) * k;
+  sway.jy += (rand(-1, 1) * A * j - sway.jy) * k;
+  sway.x = A * (0.6 * Math.sin(t * 1.9 + 0.3) + 0.3 * Math.sin(t * 3.7 + 1.7) + 0.14 * Math.sin(t * 7.9 + 4.1)) + sway.jx;
+  sway.y = A * (0.6 * Math.sin(t * 1.6 + 2.1) + 0.3 * Math.sin(t * 3.1 + 0.4) + 0.14 * Math.sin(t * 6.7 + 5.3)) + sway.jy;
+}
+
+function addShake(m) { cam.shake = Math.max(cam.shake, m * U); }
+
+/* =====================================================================
+   12. HIT TEST, PARTICLES & LOOSE PROPS
+   ===================================================================== */
+// closest approach between a ray and a segment a-b: { dist, t (along the ray) }
+function raySeg(o, d, a, b) {
+  const v = vsub(b, a), w = vsub(o, a), B = vdot(d, v), C = vdot(v, v), D = vdot(d, w), E = vdot(v, w);
+  const den = C - B * B;
+  let tc = C < 1e-12 ? 0 : (den < 1e-9 ? E / C : (E - B * D) / den);
+  tc = clamp(tc, 0, 1);
+  const q = vadd(a, vmul(v, tc)), t = Math.max(0, vdot(vsub(q, o), d));
+  return { dist: vlen(vsub(vadd(o, vmul(d, t)), q)), t };
+}
+
+// which part of the opponent a shot along `ray` strikes
+function oppHitTest(ray) {
+  const o = duel.opp, res = { zone: null, pos: null, ray };
+  if (o.dead || o.disarmed || !oppRig) return res;
+  const J = oppRig.J, up = vnorm(vsub(J.neck, J.waist));
+  const head = vlerp(J.neck, J.top, 0.62);
+  const heart = vadd(vadd(vlerp(J.waist, J.neck, 0.56), [0.07, 0, 0]), [0, 0, -0.09]);    // his left side, front of the chest
+  const T = [
+    ['head', head, head, 0.118, -0.3],
+    ['heart', heart, heart, 0.068, -0.12],
+    ['gunArm', J.shR, J.elR, 0.06, 0], ['gunArm', J.elR, J.wrR, 0.058, 0], ['gunArm', J.handR, J.handR, 0.075, 0],
+    ['torso', vadd(J.hips, vmul(up, 0.02)), vlerp(J.waist, J.neck, 0.82), 0.165, 0],
+    ['arm', J.shL, J.elL, 0.06, 0], ['arm', J.elL, J.wrL, 0.058, 0], ['arm', J.handL, J.handL, 0.07, 0],
+    ['leg', J.hipR, J.knR, 0.086, 0], ['leg', J.knR, J.anR, 0.07, 0], ['leg', J.hipL, J.knL, 0.086, 0], ['leg', J.knL, J.anL, 0.07, 0],
+  ];
+  if (!o.hatOff) {
+    T.push(['hat', vlerp(J.neck, J.top, 1.05), vlerp(J.neck, J.top, 1.42), 0.1, 0.6]);
+    T.push(['hat', vadd(J.top, [-0.17, -0.03, 0]), vadd(J.top, [0.17, -0.03, 0]), 0.035, 0.6]);
+  }
+  let best = 1e9;
+  for (const [zone, a, b, rad, bias] of T) {
+    const h = raySeg(ray.o, ray.d, a, b);
+    if (h.dist >= rad) continue;
+    const t = h.t - Math.sqrt(rad * rad - h.dist * h.dist);
+    if (t + bias < best) { best = t + bias; res.zone = zone; res.pos = vadd(ray.o, vmul(ray.d, t)); }
+  }
+  return res;
+}
+// a world point inside the named zone (used by the #debug hook and tests)
+function zonePoint(zone) {
+  const J = oppRig.J;
+  switch (zone) {
+    case 'head': return vlerp(J.neck, J.top, 0.62);
+    case 'heart': return vadd(vlerp(J.waist, J.neck, 0.56), [0.07, 0, -0.09]);
+    case 'torso': return vadd(vlerp(J.hips, J.waist, 0.7), [-0.08, 0, 0]);
+    case 'leg': return vlerp(J.knL, J.anL, 0.45);
+    case 'gunArm': return vlerp(J.elR, J.wrR, 0.55);
+    case 'hat': return vlerp(J.neck, J.top, 1.3);
+    default: return vadd(OPP_POS, [1.5, 1.2, 0]);
+  }
+}
+
+// kind: 0 soft puff, 2 droplet. Colours are display-space; sizes in metres.
+function puff(p, o) {
+  particles.push(Object.assign({ kind: 0, p: p.slice(), v: [0, 0, 0], grav: 0, life: 0, max: 1, size: 0.2, grow: 0.5, col: [0.93, 0.74, 0.5], alpha: 0.5, seed: Math.random() }, o));
+}
+function spawnBlood(p, n) {
+  puff(p, { col: [0.45, 0.03, 0.02], size: 0.06, grow: 0.4, max: 0.5, alpha: 0.8 });
+  for (let i = 0; i < n; i++) {
+    particles.push({ kind: 2, p: p.slice(), v: [rand(-0.9, 0.9), rand(0.2, 1.7), rand(-0.4, 1.4)], grav: -4.5, life: 0, max: rand(0.4, 0.9), size: rand(0.012, 0.028), grow: 0, col: [0.42, 0.02, 0.02], alpha: 0.95, seed: 0 });
+  }
+}
+// where a stray bullet lands: the dirt, or one of the building fronts
+function spawnImpact(ray) {
+  const o = ray.o, d = ray.d;
+  let best = d[1] < -1e-4 ? -o[1] / d[1] : 1e9, wall = false;
+  for (const side of [-1, 1]) {
+    if (d[0] * side < 1e-4) continue;
+    const t = (side * STREET_HALF - o[0]) / d[0];
+    if (t < best && o[1] + d[1] * t < 7) { best = t; wall = true; }
+  }
+  if (best > 160) return;
+  const p = vadd(o, vmul(d, best));
+  if (wall) puff(p, { col: [0.86, 0.78, 0.66], size: 0.05, grow: 0.55, max: 0.45, alpha: 0.55 });
+  else puff(vadd(p, [0, 0.04, 0]), { size: 0.08, grow: 0.75, max: 0.9, alpha: 0.55, v: [0, 0.4, 0] });
+}
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life += dt;
+    if (p.life >= p.max) { particles.splice(i, 1); continue; }
+    p.v[1] += p.grav * dt;
+    p.p[0] += p.v[0] * dt; p.p[1] += p.v[1] * dt; p.p[2] += p.v[2] * dt;
+    p.size += p.grow * dt;
+    if (p.kind === 2 && p.p[1] < 0.01) { p.p[1] = 0.01; p.v = [0, 0, 0]; p.grav = 0; }
+  }
+}
+
+// a hat shot off a head, or a revolver shot out of a hand: simple tumbling rigid bodies
+function spawnProp(kind, xf, c, rest) {
+  props.push({
+    kind, xf, c, rest, done: false,
+    v: [rand(-1.2, 1.2), rand(2.4, 3.4), rand(0.5, 2.2)], ax: vnorm([rand(-1, 1), rand(-0.3, 0.3), rand(-1, 1)]), rate: rand(5, 10),
+  });
+}
+const spawnHat = () => spawnProp('hat', oppRig.xf[BONE.head], [0, 1.78, 0], 0.085);
+const spawnGunProp = () => spawnProp('gun', gunXf(oppRig, true), [0, 0.03, 0.08], 0.03);
+function updateProps(dt) {
+  for (const p of props) {
+    if (p.done) continue;
+    const cw = xfPoint(p.xf, p.c);
+    p.v[1] -= 9.8 * dt;
+    let c2 = vadd(cw, vmul(p.v, dt)), Rn = m3mul(m3axis(p.ax, p.rate * dt), p.xf.R);
+    if (c2[1] <= p.rest) {                        // comes to rest in the dust
+      c2[1] = p.rest; p.done = true;
+      Rn = p.kind === 'hat' ? rotY(rand(0, TAU)) : m3mul(rotY(rand(0, TAU)), rotZ(Math.PI / 2));
+      puff([c2[0], 0.03, c2[2]], { size: 0.08, grow: 0.5, max: 0.6, alpha: 0.4 });
+    }
+    p.xf = { R: Rn, t: vsub(c2, m3v(Rn, p.c)) };
+  }
+}
+
+// drifting motes of dust in the light (drawn on the 2D overlay)
+const PUFF_DUST = (() => {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const x = c.getContext('2d'), gr = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, 'rgba(240,196,136,1)'); gr.addColorStop(0.5, 'rgba(240,196,136,0.45)'); gr.addColorStop(1, 'rgba(240,196,136,0)');
+  x.fillStyle = gr; x.fillRect(0, 0, 64, 64);
+  return c;
+})();
+let motes = [];
+function initMotes() {
+  motes = [];
+  for (let i = 0; i < 46; i++) motes.push({ x: rand(0, W), y: rand(H * 0.2, H), r: rand(1, 3.2) * U, a: rand(0.08, 0.28), vx: rand(6, 22) * U, vy: rand(-4, 4) * U, ph: rand(0, TAU) });
+}
+function updateMotes(dt) {
+  for (const m of motes) {
+    m.x += (m.vx + 8 * U * Math.sin(clock * 0.4 + m.ph)) * dt;
+    m.y += (m.vy + 5 * U * Math.sin(clock * 0.7 + m.ph * 2)) * dt;
+    if (m.x > W + 10) m.x = -10;
+    if (m.y < H * 0.15) m.y = H; else if (m.y > H + 5) m.y = H * 0.2;
+  }
+}
+function drawMotes(c) {
+  c.save(); c.globalCompositeOperation = 'lighter';
+  for (const m of motes) { c.globalAlpha = m.a; c.drawImage(PUFF_DUST, m.x - m.r * 2, m.y - m.r * 2, m.r * 4, m.r * 4); }
+  c.restore();
+}
+
+// an occasional tumbleweed rolling across the street
+const weed = { active: false, x: 0, z: 10, t: 0, next: rand(5, 12), dir: 1, rot: 0 };
+function updateWeed(dt) {
+  if (!weed.active) {
+    weed.next -= dt;
+    if (weed.next <= 0) { weed.active = true; weed.dir = Math.random() < 0.5 ? 1 : -1; weed.x = -weed.dir * 7.5; weed.z = rand(8, 13); weed.t = 0; }
+    return;
+  }
+  weed.t += dt; weed.x += weed.dir * 2.7 * dt; weed.rot -= weed.dir * 4.2 * dt;
+  if (Math.abs(weed.x) > 7.6) { weed.active = false; weed.next = rand(14, 30); }
+}
+function weedMatrix() {
+  const hop = Math.abs(Math.sin(weed.t * 3.1)) * 0.28, m = new Float32Array(16);
+  mat4RT(rotZ(weed.rot), [weed.x, 0.3 + hop, weed.z], m, 0);
+  return m;
+}
+
+/* =====================================================================
+   13. DUEL LOGIC — drawing, firing, hits, the opponent's AI
+   ===================================================================== */
+function playerDraw() {
+  if (duel.drawn) return;
+  duel.drawn = true; duel.drawnT = 0;
+  duel.off.x = rand(-50, 50) * U; duel.off.y = rand(120, 170) * U;   // the gun comes up from the hip
+  Sfx.cock();
+}
+
+function playerFire() {
+  if (!duel.drawn || duel.outcome || duel.cooldown > 0) return;
+  if (duel.ammo <= 0) { Sfx.dry(); duel.cooldown = 0.2; return; }
+  const r = reticlePos(), ray = aimRay(r.x, r.y);          // sample the aim before recoil and shake move it
+  duel.ammo--; duel.shotsFired++; duel.cooldown = CONFIG.player.fireCooldown;
+  fx.muzzle = 0.07; fx.seed = Math.random() * 10;
+  addShake(CONFIG.fx.shakeShot);
+  duel.kick.x += rand(-0.35, 0.35) * CONFIG.player.recoil * U;
+  duel.kick.y -= CONFIG.player.recoil * U;
+  Sfx.shot(false);
+  if (playerRig) puff(muzzleOf(gunXf(playerRig, true)), { col: [0.92, 0.9, 0.86], size: 0.04, grow: 0.4, max: 0.8, alpha: 0.28, v: [0.05, 0.25, 0.5] });
+  resolvePlayerShot(oppHitTest(ray));
+}
+
+function killOpponent(hit) {
+  const o = duel.opp;
+  o.dead = true; o.hp = 0;
+  o.fallDir = hit.pos && hit.pos[0] < 0 ? 1 : -1;
+  if (!o.hatOff && hit.zone === 'head') { o.hatOff = true; spawnHat(); }
+  addShake(CONFIG.fx.shakeHit * 0.6);
+}
+
+function resolvePlayerShot(hit) {
+  const o = duel.opp, Hn = CONFIG.honor, hm = duel.diff.honorMult;
+  let zone = hit.zone;
+  const lethalZone = zone === 'head' || zone === 'heart';
+
+  if (zone === 'hat') { o.hatOff = true; spawnHat(); zone = null; }
+  else if (zone) { spawnBlood(hit.pos, lethalZone ? 14 : 7); Sfx.thud(false); }
+  else spawnImpact(hit.ray);
+
+  if (duel.early) {                    // he had not drawn: this shot is dishonorable whatever it hits
+    if (lethalZone) killOpponent(hit);
+    else if (zone) { o.wounds++; o.stagger = 1; }
+    finish({ won: false, reason: 'Dishonorable — you fired before he drew', honor: Hn.dishonor, slowmo: o.dead });
+    return;
+  }
+
+  if (lethalZone) {
+    killOpponent(hit);
+    finish({ won: true, reason: zone === 'head' ? 'A clean shot, right between the eyes' : 'A clean shot, straight through the heart', honor: Math.round(Hn.cleanKill * hm), slowmo: true });
+  } else if (zone === 'gunArm') {
+    if (oppGunInHand()) spawnGunProp();
+    o.disarmed = true; o.surrenderT = 0; o.wounds++;
+    finish({ won: true, reason: 'You shot the iron out of his hand — he yields', honor: Math.round(Hn.disarm * hm), slowmo: true });
+  } else if (zone) {                   // torso or limb: a wound that slows him and spoils his aim
+    o.hp -= zone === 'torso' ? 2 : 1;
+    o.wounds++; o.stagger = 1;
+    o.stun = Math.min(1.2, o.stun + CONFIG.opponent.woundDelay);
+    if (o.hp <= 0) {
+      killOpponent(hit);
+      finish({ won: true, reason: 'He went down hard, but it was fair', honor: Math.round(Hn.messyKill * hm), slowmo: true });
+    }
+  }
+}
+
+function opponentFire() {
+  const o = duel.opp, d = duel.diff;
+  o.shots++; o.flashT = 0.08; o.flashSeed = Math.random() * 10;
+  Sfx.shot(true); addShake(4);
+  if (oppRig) puff(muzzleOf(gunXf(oppRig, true)), { col: [0.92, 0.9, 0.86], size: 0.06, grow: 0.5, max: 0.9, alpha: 0.3, v: [0, 0.3, -0.4] });
+  const acc = clamp(d.accuracy * Math.pow(CONFIG.opponent.woundAccMult, o.wounds) + CONFIG.opponent.accRampPerShot * (o.shots - 1), 0.05, 0.95);
+  if (Math.random() < acc) {
+    fx.hurt = 1;
+    Sfx.thud(true);
+    const lethal = Math.random() < d.lethal || duel.wounds + 1 >= CONFIG.player.wounds;
+    if (lethal) {
+      duel.dead = true;
+      addShake(CONFIG.fx.shakeHit);
+      const reason = !duel.drawn ? 'You never cleared leather'
+        : duel.shotsFired === 0 ? `${duel.name} beat you to the trigger`
+        : `${duel.name} shot straighter`;
+      finish({ won: false, reason, honor: 0, slowmo: true });
+    } else {
+      duel.wounds++;
+      addShake(CONFIG.fx.shakeHit * 0.7);
+    }
+  } else {
+    Sfx.whiz();
+    puff([PLAYER_POS[0] + rand(-1.2, 1.6), 0.06, PLAYER_POS[2] + rand(0.4, 3)], { size: 0.14, grow: 1.1, max: 0.8, alpha: 0.42, v: [0, 0.45, 0] });
+  }
+}
+
+function finish(out) {
+  if (duel.outcome) return;
+  duel.outcome = out;
+  const before = store.honor;
+  store.honor = clamp(store.honor + (out.honor || 0), CONFIG.honor.min, CONFIG.honor.max);
+  out.honorDelta = Math.round(store.honor - before);
+  if (out.won) store.wins++; else store.losses++;
+  saveStore();
+  fx.honorFlash = 1;
+  setState('RESULT');
+}
+
+/* =====================================================================
+   14. STATE MACHINE — INTRO → STARE → DRAW → RESULT → REMATCH
+   ===================================================================== */
+let state = 'INTRO', stateT = 0;
+
+function setState(n) {
+  state = n; stateT = 0;
+  const s = STATES[n];
+  if (s.enter) s.enter();
+}
+function startDuel() { newDuel(); setState('STARE'); }
+
+// walking away from a duel in progress counts as a loss
+function abandonIfLive() {
+  if (!duel.outcome && ((state === 'STARE' && duel.ready) || state === 'DRAW')) { store.losses++; saveStore(); }
+}
+function restart() {
+  if (state === 'REMATCH') return;
+  abandonIfLive();
+  if (state === 'INTRO') startDuel(); else setState('REMATCH');
+}
+function toMenu() {
+  if (state === 'INTRO') return;
+  abandonIfLive();
+  newDuel(); fx.fade = 0;
+  setState('INTRO');
+}
+function pickDifficulty(k) {
+  const key = Object.keys(CONFIG.difficulty)[+k - 1];
+  if (key) { store.diff = key; saveStore(); }
+}
+
+const STATES = {
+  INTRO: {
+    down() {
+      const b = menuButtons().find(b => inRect(b));
+      if (b) { store.diff = b.key; saveStore(); startDuel(); }
+    },
+    key(k) {
+      if (k === '1' || k === '2' || k === '3') pickDifficulty(k);
+      else if (k === 'enter' || k === ' ') startDuel();
+    },
+  },
+
+  STARE: {
+    update(dt) {
+      if (!duel.ready) return;
+      duel.stareT += dt;
+      duel.tremor = Math.min(CONFIG.sway.max, CONFIG.sway.base + CONFIG.sway.growthPerSec * duel.stareT);
+      if (duel.stareT >= duel.delay) setState('DRAW');
+    },
+    down() {
+      if (duel.ready) return;
+      duel.ready = true; duel.stareT = 0;
+      duel.delay = rand(CONFIG.stare.minDelay, CONFIG.stare.maxDelay);
+    },
+    up() {
+      if (!duel.ready) return;
+      if (duel.stareT < CONFIG.stare.graceRelease) {       // a stray click, not a lost nerve
+        duel.ready = false; duel.stareT = 0; duel.tremor = CONFIG.sway.base;
+        return;
+      }
+      duel.early = true;                                   // gun comes out before he has moved
+      playerDraw();
+      setState('DRAW');
+    },
+  },
+
+  DRAW: {
+    enter() {
+      duel.drawT = 0;
+      if (duel.early) return;
+      const o = duel.opp, r = duel.diff.reaction;
+      o.twitchT = CONFIG.opponent.twitchTime;
+      o.firstAt = rand(r[0], r[1]); o.nextAt = o.firstAt;
+      duel.drawFlash = 0.9;
+      Sfx.sting();
+    },
+    update(dt) {
+      duel.drawT += dt;
+      if (duel.early) {
+        duel.earlyT += dt;
+        if (duel.earlyT >= CONFIG.stare.forfeitWindow) {
+          finish({ won: false, reason: 'You broke the stare-down — forfeit', honor: CONFIG.honor.forfeit, slowmo: false });
+        }
+        return;
+      }
+      const o = duel.opp;
+      if (o.dead || o.disarmed) return;
+      if (o.stun > 0) o.stun -= dt; else o.aimT += dt;
+      o.drawP = o.shots === 0 ? clamp(o.aimT / o.firstAt, 0, 1) : 1;
+      if (o.aimT >= o.nextAt) {
+        o.nextAt = o.aimT + duel.diff.refire * rand(0.9, 1.15);
+        opponentFire();
+      }
+    },
+    up() { playerDraw(); },                                // release: pull iron
+    down() { if (duel.drawn) playerFire(); else playerDraw(); },   // click: fire
+  },
+
+  RESULT: {
+    enter() {
+      const o = duel.outcome;
+      duel.resultT = 0;
+      duel.slowmoT = o.slowmo ? CONFIG.fx.slowmoTime : 0;
+      duel.bannerAt = o.slowmo ? CONFIG.fx.slowmoTime * 0.7 : CONFIG.fx.bannerDelay;
+      duel.focusing = false;
+      if (o.slowmo) Sfx.slowmo();
+    },
+    update(dt, rdt) {
+      duel.resultT += rdt;
+      duel.slowmoT = Math.max(0, duel.slowmoT - rdt);
+      if (!duel.stingPlayed && duel.resultT >= duel.bannerAt) {
+        duel.stingPlayed = true;
+        if (duel.outcome.won) Sfx.win(); else Sfx.lose();
+      }
+    },
+    canRematch: () => duel.resultT > duel.bannerAt + 0.6,
+    down() { if (STATES.RESULT.canRematch()) setState('REMATCH'); },
+    key(k) {
+      if (k === '1' || k === '2' || k === '3') pickDifficulty(k);
+      else if ((k === 'enter' || k === ' ') && STATES.RESULT.canRematch()) setState('REMATCH');
+    },
+  },
+
+  REMATCH: {
+    update() {
+      fx.fade = Math.min(1, stateT / 0.35);
+      if (stateT >= 0.35) startDuel();
+    },
+  },
+};
+
+/* =====================================================================
+   15. PER-FRAME UPDATE
+   ===================================================================== */
+let clock = 0, rclock = 0, timeScale = 1, lastTs = 0;
+
+function computeTimeScale() {
+  if (state === 'RESULT' && duel.slowmoT > 0) return lerp(1, CONFIG.fx.slowmoScale, smooth(duel.slowmoT / 0.45));
+  return 1;
+}
+
+function updatePlayer(dt, rdt) {
+  if (duel.drawn) duel.drawnT += rdt;
+  duel.cooldown = Math.max(0, duel.cooldown - dt);
+  const offK = Math.exp(-rdt / (CONFIG.player.drawTime / 3)), kickK = Math.exp(-rdt * 9);
+  duel.off.x *= offK; duel.off.y *= offK;
+  duel.kick.x *= kickK; duel.kick.y *= kickK;
+
+  // focus: hold Shift to steady the reticle; the meter drains while it is engaged
+  const F = CONFIG.focus;
+  const want = input.shift && state === 'DRAW' && duel.drawn && !duel.outcome;
+  if (want && duel.focus > 0 && (duel.focusing || duel.focus >= F.minToEngage)) {
+    duel.focusing = true;
+    duel.focus = Math.max(0, duel.focus - F.drainPerSec * rdt);
+  } else {
+    duel.focusing = false;
+    if (!input.shift) duel.focus = Math.min(1, duel.focus + F.regenPerSec * rdt);
+  }
+  if (duel.dead) duel.deathT = Math.min(1, duel.deathT + dt / 1.1);
+}
+
+function updateOpponentAnim(dt) {
+  const o = duel.opp;
+  o.twitchT = Math.max(0, o.twitchT - dt);
+  o.flashT = Math.max(0, o.flashT - dt);
+  o.stagger = Math.max(0, o.stagger - dt * 1.6);
+  if (o.disarmed) o.surrenderT += dt;
+  if (o.dead) {
+    o.fall = Math.min(1, o.fall + dt / 0.85);
+    if (o.fall >= 1 && !o.landed) {
+      o.landed = true;
+      const w = oppRig ? oppRig.J.waist : OPP_POS;
+      puff([w[0], 0.08, w[2]], { size: 0.35, grow: 1.3, max: 1.2, alpha: 0.5, v: [0, 0.25, 0] });
+      Sfx.thud(true);
+    }
+  }
+}
+
+function updateFx(dt, rdt) {
+  fx.muzzle = Math.max(0, fx.muzzle - dt);
+  fx.hurt = Math.max(0, fx.hurt - rdt * 0.8);
+  fx.honorFlash = Math.max(0, fx.honorFlash - rdt * 0.5);
+  duel.drawFlash = Math.max(0, duel.drawFlash - rdt);
+  if (state !== 'REMATCH') fx.fade = Math.max(0, fx.fade - rdt * 2.6);
+  const k = Math.min(1, rdt * 6);
+  fx.lb += ((state === 'INTRO' ? 0 : 1) - fx.lb) * k;
+  fx.focusK += ((duel.focusing ? 1 : 0) - fx.focusK) * Math.min(1, rdt * 10);
+  fx.honorShown += (store.honor / CONFIG.honor.max - fx.honorShown) * Math.min(1, rdt * 4);
+
+  // camera: slow push-in as tension rises, a punch-in on the winning shot
+  let zt = 1;
+  if (state === 'STARE' && duel.ready) zt = 1 + 0.035 * clamp(duel.stareT / CONFIG.stare.maxDelay, 0, 1);
+  else if (state === 'DRAW') zt = 1.06;
+  else if (state === 'RESULT') zt = duel.slowmoT > 0 && duel.outcome.won ? 1.2 : 1.05;
+  cam.zoom += (zt - cam.zoom) * Math.min(1, rdt * 5);
+  cam.shake *= Math.exp(-rdt * 9);
+  if (cam.shake < 0.05) cam.shake = 0;
+  const breath = duel.drawn ? 0 : 0.12;                    // the tremor shows in the camera until the gun is out
+  cam.shx = rand(-1, 1) * cam.shake + sway.x * breath;
+  cam.shy = rand(-1, 1) * cam.shake + sway.y * breath;
+}
+
+function audioParams() {
+  const p = { tension: 0.12, music: 0.6, heart: false, bpm: 64, heartVol: 0.6, pluck: true, pluckGap: 2.6 };
+  if (state === 'STARE') {
+    if (duel.ready) {
+      const k = clamp(duel.stareT / CONFIG.stare.maxDelay, 0, 1);
+      p.tension = 0.3 + 0.6 * k; p.heart = true; p.bpm = 66 + 50 * k; p.heartVol = 0.5 + 0.5 * k; p.pluckGap = 1.5 - 0.6 * k;
+    } else { p.tension = 0.2; p.pluckGap = 2.2; }
+  } else if (state === 'DRAW') {
+    p.tension = 1; p.heart = true; p.bpm = 132; p.heartVol = 1; p.pluck = false;
+  } else if (state === 'RESULT') {
+    p.tension = duel.slowmoT > 0 ? 0.6 : 0.1; p.heart = duel.slowmoT > 0; p.bpm = 52; p.heartVol = 1; p.pluck = false; p.music = 0.5;
+  } else if (state === 'REMATCH') { p.tension = 0.1; p.pluck = false; }
+  if (duel.focusing) p.heartVol *= 1.3;
+  return p;
+}
+
+function update(dt, rdt) {
+  stateT += rdt;
+  const s = STATES[state];
+  if (s.update) s.update(dt, rdt);
+  updatePlayer(dt, rdt);
+  updateSway(rdt);
+  updateOpponentAnim(dt);
+  updateParticles(dt);
+  updateProps(dt);
+  updateMotes(dt);
+  updateWeed(dt);
+  updateFx(dt, rdt);
+  updateRigs();
+  Sfx.update(audioParams());
+}
+
+/* =====================================================================
+   16. HUD, OVERLAYS & POST EFFECTS (2D canvas on top of the 3D view)
+   ===================================================================== */
+function text(c, str, x, y, size, o = {}) {
+  size = Math.max(6, size);
+  c.font = `${o.style || ''} ${o.weight || 700} ${size}px ${SERIF}`;
+  c.textAlign = o.align || 'center'; c.textBaseline = 'middle';
+  if (HAS_LS) c.letterSpacing = (o.spacing || 0) + 'px';
+  c.globalAlpha = o.alpha === undefined ? 1 : clamp(o.alpha, 0, 1);
+  if (o.shadow) { c.shadowColor = 'rgba(0,0,0,0.7)'; c.shadowBlur = size * 0.25; c.shadowOffsetY = size * 0.06; }
+  if (o.stroke) {
+    c.lineJoin = 'round'; c.lineWidth = o.strokeW || Math.max(2, size * 0.16);
+    c.strokeStyle = o.stroke; c.strokeText(str, x, y);
+  }
+  c.shadowColor = 'transparent'; c.shadowBlur = 0; c.shadowOffsetY = 0;
+  c.fillStyle = o.color || '#f3e3c3';
+  c.fillText(str, x, y);
+  c.globalAlpha = 1;
+  if (HAS_LS) c.letterSpacing = '0px';
+}
+const INK = 'rgba(22,9,4,0.75)';
+
+function ornament(c, cx, y, w, col, alpha) {
+  c.save();
+  c.globalAlpha = alpha === undefined ? 1 : alpha;
+  c.strokeStyle = col; c.fillStyle = col; c.lineWidth = Math.max(1, 1.5 * S);
+  const d = 6 * S;
+  c.beginPath();
+  c.moveTo(cx - w / 2, y); c.lineTo(cx - d * 2, y); c.moveTo(cx + d * 2, y); c.lineTo(cx + w / 2, y);
+  c.stroke();
+  c.beginPath(); c.moveTo(cx - d, y); c.lineTo(cx, y - d); c.lineTo(cx + d, y); c.lineTo(cx, y + d); c.closePath(); c.fill();
+  c.restore();
+}
+
+function menuButtons() {
+  const keys = Object.keys(CONFIG.difficulty);
+  const gap = 14 * S, bw = Math.min(215 * S, (W - 32 - gap * 2) / 3), bh = 66 * S;
+  const x0 = (W - (bw * 3 + gap * 2)) / 2, y = H * 0.55;
+  return keys.map((k, i) => ({ key: k, x: x0 + i * (bw + gap), y, w: bw, h: bh }));
+}
+const inRect = b => input.x >= b.x && input.x <= b.x + b.w && input.y >= b.y && input.y <= b.y + b.h;
+
+function drawMenu(c) {
+  c.fillStyle = 'rgba(12,5,3,0.56)'; c.fillRect(0, 0, W, H);
+  const cx = W / 2, ts = Math.min(W * 0.1, 96 * S), ty = H * 0.25;
+  text(c, 'SUNDOWN DUEL', cx, ty, ts, { color: '#f2cf7c', stroke: '#3a1608', strokeW: ts * 0.1, spacing: ts * 0.05, shadow: true });
+  ornament(c, cx, ty + ts * 0.74, Math.min(W * 0.6, 480 * S), '#d8b470');
+  text(c, 'Fifteen metres of dust. One of you walks away.', cx, ty + ts * 0.74 + 28 * S, 19 * S, { style: 'italic', weight: 400, color: '#ead7b0', stroke: INK });
+
+  text(c, 'CHOOSE YOUR OPPONENT', cx, H * 0.55 - 22 * S, 12 * S, { spacing: 4 * S, weight: 400, color: '#d9c193' });
+  menuButtons().forEach((b, i) => {
+    const hov = inRect(b), sel = store.diff === b.key, d = CONFIG.difficulty[b.key];
+    c.fillStyle = hov ? 'rgba(120,52,22,0.9)' : 'rgba(40,20,12,0.82)';
+    c.fillRect(b.x, b.y, b.w, b.h);
+    c.strokeStyle = sel || hov ? '#f2cf7c' : 'rgba(216,180,112,0.45)'; c.lineWidth = sel ? 2.5 * S : 1.2 * S;
+    c.strokeRect(b.x, b.y, b.w, b.h);
+    text(c, d.label.toUpperCase(), b.x + b.w / 2, b.y + b.h * 0.36, Math.min(21 * S, b.w * 0.13), { color: sel || hov ? '#ffe2a0' : '#e8d2a4', spacing: 2 * S });
+    text(c, `${i + 1} · ${d.blurb}`, b.x + b.w / 2, b.y + b.h * 0.72, Math.min(12.5 * S, b.w * 0.075), { weight: 400, style: 'italic', color: '#cdb68a' });
+  });
+
+  const lines = [
+    'HOLD LEFT MOUSE to stand ready. Let go before he moves and you forfeit.',
+    'When he draws: RELEASE to pull iron, move the mouse to aim, CLICK to fire.',
+    'SHIFT steadies your hand but drains Focus.   R restart  ·  M mute  ·  ESC menu',
+    'Head or heart kills. Limbs wound. Hit his gun hand to disarm. Shooting first is dishonorable.',
+  ];
+  const fs = Math.min(15 * S, W / 62), y0 = H * 0.55 + 66 * S + 34 * S;
+  lines.forEach((l, i) => text(c, l, cx, y0 + i * fs * 1.6, fs, { weight: 400, color: i === 3 ? '#cdb68a' : '#eadcbc', stroke: INK }));
+}
+
+function drawBanner(c) {
+  const o = duel.outcome, t = duel.resultT - duel.bannerAt;
+  if (t < 0) return;
+  const a = clamp(t / 0.25, 0, 1), k = easeOutBack(t / 0.5);
+  const cx = W / 2, cy = H * 0.36, size = Math.min(W * 0.115, 120 * S);
+  const title = o.won ? 'DUEL WON' : 'DUEL LOST';
+
+  const band = c.createLinearGradient(0, 0, W, 0);
+  band.addColorStop(0, 'rgba(8,3,2,0)'); band.addColorStop(0.25, 'rgba(8,3,2,0.72)');
+  band.addColorStop(0.75, 'rgba(8,3,2,0.72)'); band.addColorStop(1, 'rgba(8,3,2,0)');
+  c.globalAlpha = a; c.fillStyle = band; c.fillRect(0, cy - size * 0.95, W, size * 1.97 + 110 * S); c.globalAlpha = 1;
+
+  c.save();
+  c.translate(cx, cy); const sc = lerp(1.6, 1, k); c.scale(sc, sc);
+  const col = o.won ? '#f2cf7c' : '#c9291c', edge = o.won ? '#3a1608' : '#1a0503';
+  text(c, title, 0, 0, size, { color: col, stroke: edge, strokeW: size * 0.09, spacing: size * 0.06, alpha: a, shadow: true });
+  const rw = Math.min(W * 0.8, size * 6.4);
+  ornament(c, 0, -size * 0.66, rw, col, a); ornament(c, 0, size * 0.66, rw, col, a);
+  c.restore();
+
+  const a2 = clamp((t - 0.25) / 0.3, 0, 1);
+  text(c, o.reason, cx, cy + size * 1.02, Math.min(23 * S, W / 34), { style: 'italic', weight: 400, color: '#f0dfc0', alpha: a2 });
+  if (o.honorDelta) {
+    text(c, `${o.honorDelta > 0 ? '+' : '−'}${Math.abs(o.honorDelta)} HONOR`, cx, cy + size * 1.02 + 30 * S, 16 * S,
+      { color: o.honorDelta > 0 ? '#f2cf7c' : '#e0584a', spacing: 3 * S, alpha: a2 });
+  }
+  if (t > 0.6) {
+    const pa = 0.6 + 0.4 * Math.sin(rclock * 4);
+    text(c, 'CLICK  or  R  —  REMATCH', cx, cy + size * 1.02 + 66 * S, 17 * S, { spacing: 3 * S, alpha: pa, color: '#ffe9bd', stroke: INK });
+    text(c, '1 · 2 · 3  difficulty      ESC  menu', cx, cy + size * 1.02 + 92 * S, 12.5 * S, { weight: 400, color: '#cdb68a', spacing: 1.5 * S, stroke: INK });
+  }
+}
+
+function drawOverlay(c) {
+  const cx = W / 2, hintY = H * (1 - CONFIG.fx.letterbox) - 20 * S;
+  if (state === 'INTRO') { drawMenu(c); return; }
+
+  if (state === 'STARE') {
+    const a = clamp(stateT / 0.5, 0, 1) * clamp((3.4 - stateT) / 0.6, 0, 1);
+    if (a > 0) {
+      text(c, 'YOUR OPPONENT', cx, H * 0.125, 12 * S, { alpha: a * 0.9, spacing: 4 * S, weight: 400, color: '#f0dcb0', stroke: INK });
+      text(c, duel.name, cx, H * 0.125 + 27 * S, 27 * S, { alpha: a, stroke: INK, color: '#ffe9bd' });
+    }
+    if (!duel.ready) {
+      text(c, 'HOLD LEFT MOUSE BUTTON TO STAND READY', cx, hintY, 17 * S, { alpha: 0.65 + 0.35 * Math.sin(rclock * 4), spacing: 2 * S, stroke: INK, color: '#ffe9bd' });
+    } else {
+      text(c, 'HOLD STEADY — WAIT FOR HIS MOVE', cx, hintY, 14 * S, { alpha: clamp(2 - duel.stareT, 0, 1) * 0.9, spacing: 2 * S, weight: 400, stroke: INK });
+    }
+  } else if (state === 'DRAW') {
+    if (duel.early) {
+      text(c, 'YOU BROKE THE STARE', cx, H * 0.24, Math.min(46 * S, W / 16), { color: '#e0584a', stroke: '#1a0503', spacing: 3 * S, alpha: clamp(duel.earlyT / 0.15, 0, 1) });
+      text(c, 'FORFEIT — HOLSTER IT, OR SHOOT AND BE DAMNED', cx, hintY, 14 * S, { spacing: 2 * S, weight: 400, stroke: INK });
+    } else {
+      if (duel.drawFlash > 0) {
+        const k = 1 - duel.drawFlash / 0.9, size = Math.min(92 * S, W / 7) * (1 + k * 0.3);
+        text(c, 'DRAW!', cx, H * 0.24, size, { color: '#ffe19a', stroke: '#5a1408', strokeW: size * 0.09, spacing: size * 0.08, alpha: clamp(duel.drawFlash / 0.35, 0, 1), shadow: true });
+      }
+      const hint = duel.drawn ? 'CLICK TO FIRE   ·   HOLD SHIFT TO FOCUS' : 'RELEASE TO DRAW';
+      text(c, hint, cx, hintY, 14 * S, { spacing: 2 * S, weight: 400, stroke: INK, alpha: 0.9 });
+    }
+  } else if (state === 'RESULT') {
+    drawBanner(c);
+  }
+}
+
+function drawReticle(c) {
+  if (state !== 'DRAW' || !duel.drawn || duel.outcome) return;
+  const r = reticlePos(), spread = 5 * S + sway.amp * 0.35;
+  c.save(); c.translate(r.x, r.y); c.lineCap = 'round';
+  const passes = [['rgba(0,0,0,0.55)', 3.4 * S], [duel.focusing ? 'rgba(255,214,130,0.98)' : 'rgba(255,244,225,0.92)', 1.5 * S]];
+  for (const [col, lw] of passes) {
+    c.strokeStyle = col; c.fillStyle = col; c.lineWidth = lw;
+    c.beginPath(); c.arc(0, 0, spread + 5 * S, 0, TAU); c.stroke();
+    c.beginPath();
+    for (let i = 0; i < 4; i++) {
+      const a = i * Math.PI / 2, ca = Math.cos(a), sa = Math.sin(a);
+      c.moveTo(ca * (spread + 2 * S), sa * (spread + 2 * S)); c.lineTo(ca * (spread + 12 * S), sa * (spread + 12 * S));
+    }
+    c.stroke();
+    c.beginPath(); c.arc(0, 0, lw * 0.75, 0, TAU); c.fill();
+  }
+  c.restore();
+}
+
+function drawHUD(c) {
+  const m = 18 * S, y0 = 12 * S;
+
+  // Honor bar
+  text(c, 'HONOR', m, y0 + 6 * S, 12 * S, { align: 'left', spacing: 2.5 * S, color: '#e9d3a6' });
+  const bx = m, by = y0 + 17 * S, bw = 190 * S, bh = 7 * S;
+  c.fillStyle = 'rgba(0,0,0,0.6)'; c.fillRect(bx - 1.5, by - 1.5, bw + 3, bh + 3);
+  const hg = c.createLinearGradient(bx, 0, bx + bw, 0);
+  hg.addColorStop(0, '#7d2218'); hg.addColorStop(0.5, '#b98a4a'); hg.addColorStop(1, '#f0d080');
+  c.fillStyle = hg; c.fillRect(bx, by, bw * clamp(fx.honorShown, 0, 1), bh);
+  if (fx.honorFlash > 0) { c.fillStyle = `rgba(255,255,255,${fx.honorFlash * 0.5})`; c.fillRect(bx, by, bw * clamp(fx.honorShown, 0, 1), bh); }
+  c.fillStyle = 'rgba(255,240,210,0.7)'; c.fillRect(bx + bw / 2 - 0.5, by - 2 * S, 1, bh + 4 * S);
+  c.strokeStyle = 'rgba(233,211,166,0.6)'; c.lineWidth = 1; c.strokeRect(bx - 1.5, by - 1.5, bw + 3, bh + 3);
+  text(c, honorRank(), bx, by + bh + 12 * S, 11 * S, { align: 'left', style: 'italic', weight: 400, color: '#cdb68a' });
+
+  // win / loss tally
+  text(c, `WON ${store.wins}    LOST ${store.losses}`, W - m, y0 + 8 * S, 13 * S, { align: 'right', spacing: 1.5 * S, color: '#e9d3a6' });
+  text(c, CONFIG.difficulty[store.diff].label.toUpperCase() + (Sfx.isMuted() ? '  ·  MUTED' : ''), W - m, y0 + 26 * S, 11 * S, { align: 'right', color: '#cdb68a', spacing: 2 * S, weight: 400 });
+
+  // focus meter + cylinder
+  if (state === 'STARE' || state === 'DRAW') {
+    const fw = 170 * S, fh = 5 * S, fx0 = W / 2 - fw / 2, fy = H - 20 * S;
+    text(c, 'FOCUS', fx0 - 10 * S, fy + fh / 2, 10 * S, { align: 'right', spacing: 2 * S, weight: 400, color: '#cdb68a' });
+    c.fillStyle = 'rgba(0,0,0,0.6)'; c.fillRect(fx0 - 1.5, fy - 1.5, fw + 3, fh + 3);
+    c.fillStyle = duel.focusing ? '#ffe19a' : (duel.focus < CONFIG.focus.minToEngage ? '#8a3a2a' : '#c9a25a');
+    c.fillRect(fx0, fy, fw * duel.focus, fh);
+    for (let i = 0; i < CONFIG.player.ammo; i++) {
+      const x = fx0 + fw + 16 * S + i * 10 * S, y = fy + fh / 2;
+      c.beginPath(); c.arc(x, y, 3.2 * S, 0, TAU);
+      if (i < duel.ammo) { c.fillStyle = '#d8b060'; c.fill(); } else { c.strokeStyle = 'rgba(216,176,96,0.5)'; c.lineWidth = 1; c.stroke(); }
+    }
+  }
+  drawReticle(c);
+}
+
+let grainPattern = null;
+function makeGrain() {
+  const g = document.createElement('canvas'); g.width = g.height = 128;
+  const x = g.getContext('2d'), im = x.createImageData(128, 128);
+  for (let i = 0; i < 128 * 128; i++) {
+    const v = Math.random() < 0.5 ? 0 : 255;
+    im.data[i * 4] = im.data[i * 4 + 1] = im.data[i * 4 + 2] = v;
+    im.data[i * 4 + 3] = Math.random() * 15;
+  }
+  x.putImageData(im, 0, 0);
+  grainPattern = ctx.createPattern(g, 'repeat');
+}
+
+function drawPost(c) {
+  const cx = W / 2, cy = H / 2, diag = Math.hypot(W, H) / 2;
+
+  if (fx.muzzle > 0) { c.fillStyle = `rgba(255,226,170,${0.2 * fx.muzzle / 0.07})`; c.fillRect(0, 0, W, H); }
+  if (fx.focusK > 0.01) { c.fillStyle = `rgba(24,14,4,${0.22 * fx.focusK})`; c.fillRect(0, 0, W, H); }
+
+  const v = c.createRadialGradient(cx, cy, diag * (0.45 - 0.12 * fx.focusK), cx, cy, diag * 1.02);
+  v.addColorStop(0, 'rgba(10,4,2,0)'); v.addColorStop(1, `rgba(10,4,2,${0.62 + 0.25 * fx.focusK})`);
+  c.fillStyle = v; c.fillRect(0, 0, W, H);
+
+  // red vignette: flashes on a hit, lingers while wounded, floods when you fall
+  const dk = smooth(duel.deathT);
+  const wounded = duel.wounds > 0 && !duel.dead ? 0.34 + 0.1 * Math.sin(rclock * 5) : 0;
+  const rv = Math.max(fx.hurt, wounded, dk);
+  if (rv > 0.01) {
+    const r = c.createRadialGradient(cx, cy, diag * (0.5 - 0.42 * rv), cx, cy, diag);
+    r.addColorStop(0, 'rgba(150,0,0,0)'); r.addColorStop(1, `rgba(150,0,0,${0.82 * rv})`);
+    c.fillStyle = r; c.fillRect(0, 0, W, H);
+  }
+  if (dk > 0) { c.fillStyle = `rgba(30,0,0,${dk * 0.5})`; c.fillRect(0, 0, W, H); }
+
+  if (grainPattern) {
+    const ox = (Math.random() * 128) | 0, oy = (Math.random() * 128) | 0;
+    c.save(); c.translate(-ox, -oy); c.fillStyle = grainPattern; c.fillRect(ox, oy, W, H); c.restore();
+  }
+
+  if (fx.lb > 0.005) {
+    const bh = H * CONFIG.fx.letterbox * fx.lb;
+    c.fillStyle = '#060302'; c.fillRect(0, 0, W, bh); c.fillRect(0, H - bh, W, bh);
+  }
+  if (fx.fade > 0) { c.fillStyle = `rgba(4,2,1,${fx.fade})`; c.fillRect(0, 0, W, H); }
+}
+
+/* =====================================================================
+   17. RENDER — shadow pass, lit scene, particles, bloom, then the 2D HUD
+   ===================================================================== */
+const IDENT4 = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1]);
+const LIGHT = {
+  sunCol: [3.0, 2.0, 1.05], fillDir: vnorm([-0.5, 0.45, -0.74]), fillCol: [0.42, 0.36, 0.32],
+  skyAmb: [0.20, 0.21, 0.31], gndAmb: [0.26, 0.17, 0.10], glowAmb: [0.5, 0.3, 0.14], exposure: 0.8, fog: 0.0034,
+};
+function rigidBones(xf) {
+  const m = new Float32Array(256);
+  for (let i = 0; i < 16; i++) mat4RT(xf.R, xf.t, m, i * 16);
+  return m;
+}
+
+// everything that uses the skinned shader this frame: [mesh, bone matrices, [part ranges]]
+function skinnedDraws() {
+  const o = duel.opp, P1 = R.player.parts, O1 = R.opp.parts, list = [];
+  const pick = (parts, names) => names.map(n => parts[n]);
+  list.push([R.player.mesh, playerRig.m, pick(P1, ['body', 'head', 'hat', 'belt', 'handL', playerGunInHand() ? 'gripR' : 'handR'])]);
+  const on = ['body', 'head', 'belt', 'handL', oppGunInHand() && !o.disarmed ? 'gripR' : 'handR'];
+  if (!o.hatOff) on.push('hat');
+  list.push([R.opp.mesh, oppRig.m, pick(O1, on)]);
+  const whole = [{ start: 0, count: GUN_MESH.count }];
+  list.push([GUN_MESH, rigidBones(gunXf(playerRig, playerGunInHand(), R.player)), whole]);
+  if (!o.disarmed || !oppGunInHand()) list.push([GUN_MESH, rigidBones(gunXf(oppRig, oppGunInHand(), R.opp)), whole]);
+  for (const p of props) {
+    if (p.kind === 'hat') list.push([R.opp.mesh, rigidBones(p.xf), [O1.hat]]);
+    else list.push([GUN_MESH, rigidBones(p.xf), whole]);
+  }
+  return list;
+}
+function drawSkinned(prog, list) {
+  for (const [mesh, bones, ranges] of list) {
+    gl.bindVertexArray(mesh.vao);
+    gl.uniformMatrix4fv(prog.u('uBones'), false, bones);
+    for (const r of ranges) gl.drawElements(gl.TRIANGLES, r.count, gl.UNSIGNED_INT, r.start * 4);
+  }
+}
+function setLights(prog, vp, flash) {
+  gl.useProgram(prog.p);
+  gl.uniformMatrix4fv(prog.u('uVP'), false, vp);
+  gl.uniformMatrix4fv(prog.u('uLightVP'), false, R.lightVP);
+  gl.uniform3fv(prog.u('uSunDir'), R.sun); gl.uniform3fv(prog.u('uSunCol'), LIGHT.sunCol);
+  gl.uniform3fv(prog.u('uFillDir'), LIGHT.fillDir); gl.uniform3fv(prog.u('uFillCol'), LIGHT.fillCol);
+  gl.uniform3fv(prog.u('uSkyAmb'), LIGHT.skyAmb); gl.uniform3fv(prog.u('uGndAmb'), LIGHT.gndAmb); gl.uniform3fv(prog.u('uGlowAmb'), LIGHT.glowAmb);
+  gl.uniform3f(prog.u('uCam'), 0, EYE, 0);
+  gl.uniform1f(prog.u('uExposure'), LIGHT.exposure); gl.uniform1f(prog.u('uFog'), LIGHT.fog);
+  gl.uniform1f(prog.u('uTime'), rclock); gl.uniform1f(prog.u('uShadowTexel'), 1 / CONFIG.gfx.shadowRes);
+  gl.uniform4fv(prog.u('uFlash'), flash); gl.uniform3f(prog.u('uFlashCol'), 1.0, 0.72, 0.38);
+  gl.uniform1i(prog.u('uShadow'), 0); gl.uniform1i(prog.u('uAtlas'), 1);
+}
+
+function particleBuffer() {
+  const list = particles.slice().sort((a, b) => b.p[2] - a.p[2]), quads = [];
+  for (const p of list) quads.push([p.p, p.size, p.kind, p.seed, p.col, p.alpha * (1 - p.life / p.max)]);
+  if (fx.muzzle > 0 && playerRig) quads.push([muzzleOf(gunXf(playerRig, true)), 0.26, 1, fx.seed, [1, 0.86, 0.6], fx.muzzle / 0.07]);
+  const o = duel.opp;
+  if (o.flashT > 0 && oppRig) quads.push([muzzleOf(gunXf(oppRig, true)), 0.42, 1, o.flashSeed, [1, 0.86, 0.6], o.flashT / 0.08]);
+  const out = new Float32Array(quads.length * 72), C = [-1, -1, 1, -1, 1, 1, -1, -1, 1, 1, -1, 1];
+  let k = 0;
+  for (const [p, size, kind, seed, col, a] of quads) for (let v = 0; v < 6; v++) {
+    out[k++] = p[0]; out[k++] = p[1]; out[k++] = p[2]; out[k++] = C[v * 2]; out[k++] = C[v * 2 + 1];
+    out[k++] = col[0]; out[k++] = col[1]; out[k++] = col[2]; out[k++] = a;
+    out[k++] = size; out[k++] = kind; out[k++] = seed;
+  }
+  return { data: out, count: quads.length * 6 };
+}
+
+function renderGL() {
+  const g = gl, vp = viewProj(), skinned = skinnedDraws();
+  g.disable(g.CULL_FACE); g.disable(g.BLEND); g.enable(g.DEPTH_TEST); g.depthFunc(g.LEQUAL); g.depthMask(true);
+
+  // 1. shadow map from the sun
+  g.bindFramebuffer(g.FRAMEBUFFER, R.shadowFbo);
+  g.viewport(0, 0, CONFIG.gfx.shadowRes, CONFIG.gfx.shadowRes);
+  g.clear(g.DEPTH_BUFFER_BIT);
+  g.enable(g.POLYGON_OFFSET_FILL); g.polygonOffset(1.5, 3);
+  g.useProgram(R.depthS.p);
+  g.uniformMatrix4fv(R.depthS.u('uVP'), false, R.lightVP); g.uniformMatrix4fv(R.depthS.u('uModel'), false, IDENT4);
+  g.bindVertexArray(R.town.mesh.vao);
+  g.drawElements(g.TRIANGLES, R.town.mesh.count - R.town.groundCount, g.UNSIGNED_INT, R.town.groundCount * 4);
+  if (weed.active) { g.uniformMatrix4fv(R.depthS.u('uModel'), false, weedMatrix()); g.bindVertexArray(R.weed.vao); g.drawElements(g.TRIANGLES, R.weed.count, g.UNSIGNED_INT, 0); }
+  g.useProgram(R.depthK.p);
+  g.uniformMatrix4fv(R.depthK.u('uVP'), false, R.lightVP);
+  drawSkinned(R.depthK, skinned);
+  g.disable(g.POLYGON_OFFSET_FILL);
+
+  // 2. the scene, into a multisampled buffer
+  g.bindFramebuffer(g.FRAMEBUFFER, R.msaa.fbo);
+  g.viewport(0, 0, R.msaa.w, R.msaa.h);
+  g.clear(g.DEPTH_BUFFER_BIT);
+  g.activeTexture(g.TEXTURE0); g.bindTexture(g.TEXTURE_2D, R.shadowTex);
+  g.activeTexture(g.TEXTURE1); g.bindTexture(g.TEXTURE_2D, R.atlas);
+
+  g.disable(g.DEPTH_TEST);
+  g.useProgram(R.sky.p);
+  const inv = affInv(camAffine());
+  g.uniform3f(R.sky.u('uRow0'), inv[0], inv[2], inv[4]); g.uniform3f(R.sky.u('uRow1'), inv[1], inv[3], inv[5]);
+  g.uniform4f(R.sky.u('uView'), view.vx, view.hy, view.f, H);
+  g.uniform1f(R.sky.u('uRS'), R.msaa.w / W); g.uniform1f(R.sky.u('uTime'), rclock);
+  g.uniform3fv(R.sky.u('uSunDir'), R.sun); g.uniform1f(R.sky.u('uExposure'), LIGHT.exposure);
+  g.bindVertexArray(R.emptyVao); g.drawArrays(g.TRIANGLES, 0, 3);
+  g.enable(g.DEPTH_TEST);
+
+  const o = duel.opp;
+  let flash = [0, 0, 0, 0];
+  if (fx.muzzle > 0) { const m = muzzleOf(gunXf(playerRig, true)); flash = [m[0], m[1], m[2], 6 * fx.muzzle / 0.07]; }
+  else if (o.flashT > 0) { const m = muzzleOf(gunXf(oppRig, true)); flash = [m[0], m[1], m[2], 6 * o.flashT / 0.08]; }
+
+  setLights(R.scene, vp, flash);
+  g.uniform1f(R.scene.u('uTwoSided'), 1); g.uniformMatrix4fv(R.scene.u('uModel'), false, IDENT4);
+  g.bindVertexArray(R.town.mesh.vao); g.drawElements(g.TRIANGLES, R.town.mesh.count, g.UNSIGNED_INT, 0);
+  if (weed.active) { g.uniformMatrix4fv(R.scene.u('uModel'), false, weedMatrix()); g.bindVertexArray(R.weed.vao); g.drawElements(g.TRIANGLES, R.weed.count, g.UNSIGNED_INT, 0); }
+
+  setLights(R.skin, vp, flash);
+  g.uniform1f(R.skin.u('uTwoSided'), 0);
+  drawSkinned(R.skin, skinned);
+
+  const pb = particleBuffer();
+  if (pb.count) {
+    g.enable(g.BLEND); g.blendFunc(g.ONE, g.ONE_MINUS_SRC_ALPHA); g.depthMask(false);
+    g.useProgram(R.part.p); g.uniformMatrix4fv(R.part.u('uVP'), false, vp);
+    g.bindVertexArray(R.partVao); g.bindBuffer(g.ARRAY_BUFFER, R.partBuf);
+    g.bufferData(g.ARRAY_BUFFER, pb.data, g.DYNAMIC_DRAW);
+    g.drawArrays(g.TRIANGLES, 0, pb.count);
+    g.disable(g.BLEND); g.depthMask(true);
+  }
+
+  // 3. resolve, bloom, composite
+  g.bindFramebuffer(g.READ_FRAMEBUFFER, R.msaa.fbo); g.bindFramebuffer(g.DRAW_FRAMEBUFFER, R.resolve.fbo);
+  g.blitFramebuffer(0, 0, R.msaa.w, R.msaa.h, 0, 0, R.msaa.w, R.msaa.h, g.COLOR_BUFFER_BIT, g.NEAREST);
+  g.disable(g.DEPTH_TEST);
+  g.bindVertexArray(R.emptyVao); g.activeTexture(g.TEXTURE0);
+  const pass = (prog, src, dst, set) => {
+    g.bindFramebuffer(g.FRAMEBUFFER, dst ? dst.fbo : null);
+    g.viewport(0, 0, dst ? dst.w : glCanvas.width, dst ? dst.h : glCanvas.height);
+    g.useProgram(prog.p); g.bindTexture(g.TEXTURE_2D, src.tex); g.uniform1i(prog.u('uTex'), 0);
+    set(); g.drawArrays(g.TRIANGLES, 0, 3);
+  };
+  const A = R.bloomA, B2 = R.bloomB;
+  pass(R.bright, R.resolve, A, () => g.uniform2f(R.bright.u('uTexel'), 1 / R.resolve.w, 1 / R.resolve.h));
+  for (const sp of [1, 2.2]) {
+    pass(R.blur, A, B2, () => g.uniform2f(R.blur.u('uDir'), sp / A.w, 0));
+    pass(R.blur, B2, A, () => g.uniform2f(R.blur.u('uDir'), 0, sp / A.h));
+  }
+  pass(R.final, R.resolve, null, () => {
+    g.activeTexture(g.TEXTURE2); g.bindTexture(g.TEXTURE_2D, A.tex); g.uniform1i(R.final.u('uBloom'), 2);
+    g.uniform1f(R.final.u('uBloomK'), CONFIG.gfx.bloom); g.activeTexture(g.TEXTURE0);
+  });
+  g.bindVertexArray(null);
+}
+
+let cursorNow = '';
+function render() {
+  renderGL();
+  const c = ctx;
+  c.setTransform(DPR, 0, 0, DPR, 0, 0);
+  c.globalAlpha = 1; c.globalCompositeOperation = 'source-over';
+  c.clearRect(0, 0, W, H);
+  drawMotes(c);
+  drawPost(c);
+  drawOverlay(c);
+  drawHUD(c);
+
+  let cur = 'none';
+  if (state === 'INTRO') cur = menuButtons().some(inRect) ? 'pointer' : 'default';
+  else if (state === 'RESULT') cur = 'default';
+  if (cur !== cursorNow) { cursorNow = cur; hud.style.cursor = cur; }
+}
+
+/* =====================================================================
+   18. BOOT & MAIN LOOP
+   ===================================================================== */
+const DEBUG = { paused: false };
+function frame(ts) {
+  if (DEBUG.paused) { lastTs = ts; requestAnimationFrame(frame); return; }
+  const rdt = Math.min(0.05, Math.max(0, (ts - lastTs) / 1000));
+  lastTs = ts;
+  timeScale = computeTimeScale();
+  const dt = rdt * timeScale;
+  clock += dt; rclock += rdt;
+  update(dt, rdt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+function splash(line, sub) {
+  const c = ctx;
+  c.setTransform(DPR, 0, 0, DPR, 0, 0);
+  c.fillStyle = '#0d0705'; c.fillRect(0, 0, W, H);
+  text(c, 'SUNDOWN DUEL', W / 2, H * 0.42, Math.min(W * 0.09, 84 * S), { color: '#f2cf7c', stroke: '#3a1608', spacing: 4 * S });
+  text(c, line, W / 2, H * 0.42 + 80 * S, 17 * S, { weight: 400, style: 'italic', color: '#ead7b0' });
+  if (sub) text(c, sub, W / 2, H * 0.42 + 110 * S, 13 * S, { weight: 400, color: '#cdb68a' });
+}
+
+glCanvas.addEventListener('webglcontextlost', e => {
+  e.preventDefault(); R.ready = false; DEBUG.paused = true;
+  splash('The graphics context was lost.', 'Reload the page to continue.');
+});
+
+loadStore();
+fx.honorShown = store.honor / CONFIG.honor.max;
+newDuel();
+input.x = window.innerWidth / 2; input.y = window.innerHeight / 2;
+resize();
+makeGrain();
+
+// Building the models takes a moment, so it runs in steps with a message between each.
+const bootSteps = [
+  ['Raising the town…', () => { if (!glInit()) throw new Error('WebGL2 is not available'); glResize(); R.town = buildTown(); R.weed = buildWeed(); }],
+  ['Forging the iron…', () => buildGun()],
+  ['Sculpting your opponent…', () => { R.opp = buildCharacter({ pal: PALETTES.opp, long: true, bandana: true, mustache: true, q: 1.45, belt: { rx: 0.188, rz: 0.15, slant: 0.02, cartridges: false } }); }],
+  ['Sculpting the gunslinger…', () => { R.player = buildCharacter({ pal: PALETTES.player, long: false, shirtSleeves: true, bandana: false, mustache: false, q: 0.875, belt: { rx: 0.192, rz: 0.146, slant: 0.03, cartridges: true } }); }],
+];
+function bootNext(i) {
+  if (i >= bootSteps.length) {
+    R.ready = true;
+    updateRigs();
+    requestAnimationFrame(ts => { lastTs = ts; requestAnimationFrame(frame); });
+    return;
+  }
+  splash(bootSteps[i][0]);
+  setTimeout(() => {
+    try { bootSteps[i][1](); } catch (e) {
+      R.failed = true;
+      splash('This game needs WebGL2, which this browser could not start.', String(e && e.message || e));
+      if (window.console) console.error(e);
+      return;
+    }
+    bootNext(i + 1);
+  }, 30);
+}
+bootNext(0);
+
+// test hook: open duel.html#debug to inspect state from the console
+if (location.hash.indexOf('debug') >= 0) {
+  window.__duel = {
+    CONFIG, store, LIGHT, R, DEBUG, OPP_XF, PLAYER_XF,
+    step(dt, noDraw) { clock += dt; rclock += dt; update(dt, dt); if (!noDraw) { render(); gl.finish(); } },
+    get state() { return state; },
+    get duel() { return duel; },
+    get timeScale() { return timeScale; },
+    get ready() { return !!R.ready; },
+    aimPoint(zone) { return projectWorld(zonePoint(zone)); },
+  };
+}
+})();
+</script>
+</body>
+</html>
