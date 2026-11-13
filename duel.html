@@ -1,0 +1,1855 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sundown Duel</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #0d0705; overflow: hidden; }
+  canvas {
+    display: block; position: fixed; inset: 0; width: 100%; height: 100%;
+    cursor: none; user-select: none; -webkit-user-select: none; touch-action: none;
+  }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+(() => {
+'use strict';
+
+/* =====================================================================
+   1. CONFIG — every tuning knob lives here
+   ===================================================================== */
+const CONFIG = {
+  distance: 15,                       // metres between the duellists
+  camera: { eyeHeight: 1.62, focal: 1.3, horizon: 0.5, vanishX: 0.58 },
+
+  stare: {
+    minDelay: 2,                      // seconds before the opponent may move
+    maxDelay: 6,
+    graceRelease: 0.3,                // releasing this soon just cancels "ready"
+    forfeitWindow: 0.9,               // gun is out after an early release; a shot here is dishonorable
+  },
+
+  sway: {                             // reticle sway, in px at an 800px-tall view
+    base: 6,
+    growthPerSec: 3.5,                // hand tremor grows while the stare-down lasts
+    max: 28,
+    woundMult: 1.7,
+    jitter: 0.3,
+  },
+
+  focus: { swayMult: 0.14, drainPerSec: 0.42, regenPerSec: 0.08, minToEngage: 0.06 },
+
+  player: { ammo: 6, fireCooldown: 0.38, drawTime: 0.28, recoil: 44, wounds: 2 },
+
+  opponent: { hp: 3, twitchTime: 0.25, woundDelay: 0.55, woundAccMult: 0.6, accRampPerShot: 0.08 },
+
+  difficulty: {
+    greenhorn:  { label: 'Greenhorn',  blurb: 'Slow hand, shaky aim',   reaction: [1.15, 1.65], accuracy: 0.35, lethal: 0.35, refire: 1.05, honorMult: 1 },
+    gunslinger: { label: 'Gunslinger', blurb: 'Steady and dangerous',   reaction: [0.80, 1.10], accuracy: 0.60, lethal: 0.55, refire: 0.80, honorMult: 1.5 },
+    legend:     { label: 'Legend',     blurb: "Blink and you're dead",  reaction: [0.55, 0.75], accuracy: 0.85, lethal: 0.75, refire: 0.60, honorMult: 2 },
+  },
+
+  honor: { start: 50, min: 0, max: 100, cleanKill: 10, messyKill: 5, disarm: 14, dishonor: -25, forfeit: -2 },
+
+  fx: { slowmoScale: 0.16, slowmoTime: 1.9, bannerDelay: 0.7, shakeShot: 9, shakeHit: 20, letterbox: 0.07 },
+
+  audio: { master: 0.7 },
+  storageKey: 'sundownDuel.v1',
+};
+
+/* =====================================================================
+   2. UTILITIES
+   ===================================================================== */
+const TAU = Math.PI * 2;
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const lerp = (a, b, t) => a + (b - a) * t;
+const rand = (a, b) => a + Math.random() * (b - a);
+const smooth = t => { t = clamp(t, 0, 1); return t * t * (3 - 2 * t); };
+const easeOut = t => 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+const easeOutBack = t => { t = clamp(t, 0, 1) - 1; return 1 + 2.70158 * t * t * t + 1.70158 * t * t; };
+const mix = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t), lerp(a[2], b[2], t)];
+const mix2 = (a, b, t) => [lerp(a[0], b[0], t), lerp(a[1], b[1], t)];
+const shade = (c, k) => [c[0] * k, c[1] * k, c[2] * k];
+const rgb = (c, a) => a === undefined
+  ? `rgb(${c[0] | 0},${c[1] | 0},${c[2] | 0})`
+  : `rgba(${c[0] | 0},${c[1] | 0},${c[2] | 0},${a})`;
+
+function mulberry32(a) {
+  return function () {
+    a |= 0; a = a + 0x6D2B79F5 | 0;
+    let t = Math.imul(a ^ a >>> 15, 1 | a);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+
+function distSeg(px, py, a, b) {
+  const dx = b[0] - a[0], dy = b[1] - a[1];
+  const l2 = dx * dx + dy * dy;
+  const t = l2 ? clamp(((px - a[0]) * dx + (py - a[1]) * dy) / l2, 0, 1) : 0;
+  return Math.hypot(px - (a[0] + dx * t), py - (a[1] + dy * t));
+}
+
+/* =====================================================================
+   3. PERSISTENCE — honor + win/loss tally in localStorage
+   ===================================================================== */
+const store = { honor: CONFIG.honor.start, wins: 0, losses: 0, diff: 'gunslinger' };
+
+function loadStore() {
+  try {
+    const o = JSON.parse(localStorage.getItem(CONFIG.storageKey) || 'null');
+    if (o && typeof o === 'object') {
+      if (Number.isFinite(o.honor)) store.honor = clamp(o.honor, CONFIG.honor.min, CONFIG.honor.max);
+      if (Number.isFinite(o.wins)) store.wins = Math.max(0, Math.floor(o.wins));
+      if (Number.isFinite(o.losses)) store.losses = Math.max(0, Math.floor(o.losses));
+      if (CONFIG.difficulty[o.diff]) store.diff = o.diff;
+    }
+  } catch (e) { /* storage unavailable or corrupt: play with defaults */ }
+}
+function saveStore() {
+  try { localStorage.setItem(CONFIG.storageKey, JSON.stringify(store)); } catch (e) { /* ignore */ }
+}
+
+function honorRank() {
+  const h = store.honor;
+  if (h < 20) return 'Scoundrel';
+  if (h < 40) return 'Drifter';
+  if (h < 60) return 'Stranger';
+  if (h < 80) return 'Straight Shooter';
+  return 'Legend of the Territory';
+}
+
+/* =====================================================================
+   4. AUDIO — everything synthesised with the Web Audio API.
+      The context is created on the first user gesture (autoplay policy).
+   ===================================================================== */
+const Sfx = (() => {
+  let ac = null, master = null, echoIn = null, noiseBuf = null;
+  let droneGain = null, droneLP = null, tremGain = null;
+  let muted = false, nextBeat = 0, nextPluck = 0, step = 0;
+  const NOTES = [146.83, 220.0, 174.61, 146.83, 130.81, 155.56, 146.83, 110.0];
+
+  function resume() {
+    if (ac && ac.state !== 'running' && ac.state !== 'closed') {
+      const p = ac.resume();
+      if (p && p.catch) p.catch(() => {});
+    }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (!ac || ac.state === 'closed') return;
+    if (document.hidden) { const p = ac.suspend(); if (p && p.catch) p.catch(() => {}); }
+    else resume();
+  });
+
+  function init() {
+    if (ac) { resume(); return; }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      ac = new AC();
+      master = ac.createGain();
+      master.gain.value = muted ? 0 : CONFIG.audio.master;
+      const comp = ac.createDynamicsCompressor();
+      master.connect(comp); comp.connect(ac.destination);
+
+      // canyon echo bus
+      echoIn = ac.createGain();
+      const dl = ac.createDelay(1.0); dl.delayTime.value = 0.34;
+      const fb = ac.createGain(); fb.gain.value = 0.36;
+      const lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 1400;
+      echoIn.connect(dl); dl.connect(lp); lp.connect(fb); fb.connect(dl); lp.connect(master);
+
+      // shared noise buffer
+      const len = Math.floor(ac.sampleRate * 2);
+      noiseBuf = ac.createBuffer(1, len, ac.sampleRate);
+      const d = noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+
+      // wind bed
+      const wind = ac.createBufferSource(); wind.buffer = noiseBuf; wind.loop = true;
+      const wf = ac.createBiquadFilter(); wf.type = 'bandpass'; wf.frequency.value = 380; wf.Q.value = 0.7;
+      const wg = ac.createGain(); wg.gain.value = 0.05;
+      const lfo = ac.createOscillator(); lfo.frequency.value = 0.11;
+      const lg = ac.createGain(); lg.gain.value = 170;
+      lfo.connect(lg); lg.connect(wf.frequency);
+      wind.connect(wf); wf.connect(wg); wg.connect(master);
+      wind.start(); lfo.start();
+
+      // tension drone
+      droneLP = ac.createBiquadFilter(); droneLP.type = 'lowpass'; droneLP.frequency.value = 200; droneLP.Q.value = 2;
+      droneGain = ac.createGain(); droneGain.gain.value = 0;
+      [[73.42, 'sawtooth', 0.5], [73.9, 'sawtooth', 0.5], [36.71, 'sine', 0.9], [110.3, 'triangle', 0.25]].forEach(([f, type, v]) => {
+        const o = ac.createOscillator(); o.type = type; o.frequency.value = f;
+        const g = ac.createGain(); g.gain.value = v;
+        o.connect(g); g.connect(droneLP); o.start();
+      });
+      droneLP.connect(droneGain); droneGain.connect(master);
+
+      // tremolo "strings" (a tight dissonant cluster)
+      tremGain = ac.createGain(); tremGain.gain.value = 0;
+      const am = ac.createGain(); am.gain.value = 0.55;
+      const tl = ac.createOscillator(); tl.frequency.value = 7.3;
+      const tg = ac.createGain(); tg.gain.value = 0.45;
+      tl.connect(tg); tg.connect(am.gain); tl.start();
+      const sf = ac.createBiquadFilter(); sf.type = 'lowpass'; sf.frequency.value = 1800;
+      [[440, 'sawtooth'], [466.16, 'sawtooth'], [587.33, 'triangle']].forEach(([f, type]) => {
+        const o = ac.createOscillator(); o.type = type; o.frequency.value = f; o.detune.value = rand(-6, 6);
+        o.connect(sf); o.start();
+      });
+      sf.connect(am); am.connect(tremGain); tremGain.connect(master); tremGain.connect(echoIn);
+    } catch (e) {
+      ac = null;
+      return;
+    }
+    resume();
+  }
+
+  const ok = () => !!ac && ac.state === 'running';
+
+  function env(g, t, vol, attack, dur) {
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(Math.max(0.0002, vol), t + attack);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + Math.max(dur, attack + 0.01));
+  }
+  function out(g, echo) {
+    g.connect(master);
+    if (echo) { const s = ac.createGain(); s.gain.value = echo; g.connect(s); s.connect(echoIn); }
+  }
+  function tone(freq, type, t, dur, vol, o = {}) {
+    const osc = ac.createOscillator(); osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    if (o.to) osc.frequency.exponentialRampToValueAtTime(o.to, t + (o.glide || dur));
+    const g = ac.createGain(); env(g, t, vol, o.attack || 0.005, dur);
+    let node = osc;
+    if (o.lp) {
+      const f = ac.createBiquadFilter(); f.type = 'lowpass';
+      f.frequency.setValueAtTime(o.lp, t);
+      if (o.lpTo) f.frequency.exponentialRampToValueAtTime(o.lpTo, t + dur);
+      node.connect(f); node = f;
+    }
+    node.connect(g); out(g, o.echo);
+    osc.start(t); osc.stop(t + dur + 0.05);
+  }
+  function noise(t, dur, vol, type, f0, f1, o = {}) {
+    const src = ac.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+    const f = ac.createBiquadFilter(); f.type = type; f.Q.value = o.q || 0.7;
+    f.frequency.setValueAtTime(f0, t);
+    if (f1) f.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    const g = ac.createGain(); env(g, t, vol, o.attack || 0.002, dur);
+    src.connect(f); f.connect(g); out(g, o.echo);
+    src.start(t, Math.random() * 1.5); src.stop(t + dur + 0.05);
+  }
+  function pluck(f, t, vol) {
+    tone(f, 'sawtooth', t, 1.3, vol, { lp: 2400, lpTo: 260, attack: 0.004, echo: 0.35 });
+    tone(f * 2.003, 'triangle', t, 0.5, vol * 0.35, { attack: 0.003 });
+  }
+  function beat(t, vol) {
+    tone(64, 'sine', t, 0.17, 0.75 * vol, { to: 38, glide: 0.12 });
+    tone(128, 'triangle', t, 0.07, 0.14 * vol, { to: 70, lp: 400 });
+    tone(56, 'sine', t + 0.16, 0.15, 0.5 * vol, { to: 36, glide: 0.1 });
+  }
+
+  return {
+    init,
+    toggleMute() {
+      muted = !muted;
+      if (ac) master.gain.setTargetAtTime(muted ? 0 : CONFIG.audio.master, ac.currentTime, 0.02);
+      return muted;
+    },
+    isMuted: () => muted,
+    shot(far) {
+      if (!ok()) return;
+      const t = ac.currentTime + (far ? 0.045 : 0), v = far ? 0.55 : 1;
+      noise(t, 0.09, 0.9 * v, 'highpass', far ? 700 : 1200, 0);
+      noise(t, far ? 0.5 : 0.42, 0.95 * v, 'lowpass', far ? 1800 : 3200, 220, { echo: 0.6 });
+      tone(far ? 120 : 160, 'sine', t, 0.22, 0.9 * v, { to: 42, glide: 0.14 });
+    },
+    whiz() { if (ok()) noise(ac.currentTime, 0.22, 0.35, 'bandpass', 3800, 700, { q: 6 }); },
+    thud(heavy) {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      tone(heavy ? 95 : 130, 'sine', t, heavy ? 0.3 : 0.16, heavy ? 0.8 : 0.45, { to: 40 });
+      noise(t, 0.08, 0.3, 'lowpass', 700, 200);
+    },
+    dry() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      tone(1900, 'square', t, 0.03, 0.12);
+      noise(t, 0.025, 0.2, 'highpass', 3000, 0);
+    },
+    cock() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      noise(t, 0.03, 0.25, 'highpass', 2500, 0);
+      tone(1300, 'square', t + 0.05, 0.025, 0.1);
+      noise(t + 0.05, 0.03, 0.22, 'bandpass', 4200, 0, { q: 3 });
+    },
+    sting() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      [146.83, 155.56, 220, 293.66].forEach(f => tone(f, 'sawtooth', t, 0.9, 0.16, { lp: 2600, lpTo: 300, attack: 0.008, echo: 0.4 }));
+      noise(t, 0.25, 0.18, 'highpass', 5000, 0);
+      tone(73.4, 'sine', t, 0.8, 0.5, { to: 55 });
+    },
+    slowmo() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      tone(220, 'sine', t, 1.4, 0.18, { to: 40, glide: 1.3 });
+      noise(t, 1.2, 0.12, 'lowpass', 1200, 120);
+    },
+    win() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      [146.83, 220, 293.66, 369.99, 440].forEach((f, i) => pluck(f, t + i * 0.07, 0.16));
+    },
+    lose() {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      [146.83, 138.59, 116.54, 98].forEach((f, i) => tone(f, 'triangle', t + i * 0.32, 0.9, 0.2, { lp: 900, echo: 0.3 }));
+      tone(49, 'sine', t + 1.0, 1.6, 0.4);
+    },
+    // called every frame with the current musical state
+    update(p) {
+      if (!ok()) return;
+      const t = ac.currentTime;
+      droneGain.gain.setTargetAtTime(p.music * (0.05 + 0.13 * p.tension), t, 0.3);
+      droneLP.frequency.setTargetAtTime(180 + 700 * p.tension, t, 0.3);
+      tremGain.gain.setTargetAtTime(p.music * 0.05 * Math.pow(p.tension, 1.5), t, 0.3);
+      if (p.heart) {
+        if (nextBeat < t - 0.1) nextBeat = t + 0.03;
+        if (t >= nextBeat - 0.05) { beat(Math.max(t, nextBeat), p.heartVol); nextBeat += 60 / p.bpm; }
+      }
+      if (p.pluck) {
+        if (nextPluck < t - 0.5) nextPluck = t + 0.5;
+        if (t >= nextPluck - 0.05) {
+          pluck(NOTES[step++ % NOTES.length], Math.max(t, nextPluck), 0.1);
+          nextPluck += p.pluckGap * rand(0.8, 1.3);
+        }
+      }
+    },
+  };
+})();
+
+/* =====================================================================
+   5. CANVAS, VIEW & PROJECTION
+   ===================================================================== */
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const HAS_LS = 'letterSpacing' in ctx;
+const SERIF = '"Rockwell","Rockwell Extra Bold","Clarendon","Bookman Old Style","Georgia","Times New Roman",serif';
+
+let W = 0, H = 0, DPR = 1, U = 1, S = 1;        // U: world px unit (H/800), S: UI scale
+const view = { vx: 0, hy: 0, f: 0, sun: [0, 0] };
+const PAD = 32;                                  // static layer is drawn oversize so shake never shows an edge
+const STREET_HALF = 5.6;                         // metres from street centre to the building fronts
+const PLAYER_Z = 2.4, PLAYER_X = -0.6;           // where the player stands relative to the camera
+let bg = null;
+
+// world (metres) -> screen px. x = across the street, y = up, z = depth from the camera
+function P(x, y, z) {
+  const s = view.f / z;
+  return [view.vx + x * s, view.hy - (y - CONFIG.camera.eyeHeight) * s, s];
+}
+
+const cam = { zoom: 1, shx: 0, shy: 0, shake: 0 };
+const zoomCenter = () => [view.vx, view.hy + H * 0.05];
+
+function applyWorld(c) {
+  const [cx, cy] = zoomCenter();
+  c.translate(cx + cam.shx, cy + cam.shy); c.scale(cam.zoom, cam.zoom); c.translate(-cx, -cy);
+}
+function screenToWorld(x, y) {
+  const [cx, cy] = zoomCenter();
+  return { x: (x - cx - cam.shx) / cam.zoom + cx, y: (y - cy - cam.shy) / cam.zoom + cy };
+}
+function worldToScreen(x, y) {
+  const [cx, cy] = zoomCenter();
+  return { x: (x - cx) * cam.zoom + cx + cam.shx, y: (y - cy) * cam.zoom + cy + cam.shy };
+}
+// the foreground (player) zooms a little harder than the world for parallax
+const fgZoom = () => 1 + (cam.zoom - 1) * 2;
+function applyFg(c) {
+  const [cx, cy] = zoomCenter(), z = fgZoom();
+  c.translate(cx + cam.shx * 1.4, cy + cam.shy * 1.4); c.scale(z, z); c.translate(-cx, -cy);
+}
+function screenToFg(x, y) {
+  const [cx, cy] = zoomCenter(), z = fgZoom();
+  return { x: (x - cx - cam.shx * 1.4) / z + cx, y: (y - cy - cam.shy * 1.4) / z + cy };
+}
+
+function resize() {
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = Math.max(320, window.innerWidth);
+  H = Math.max(240, window.innerHeight);
+  canvas.width = Math.round(W * DPR);
+  canvas.height = Math.round(H * DPR);
+  U = H / 800;
+  S = clamp(Math.min(W / 1100, H / 760), 0.45, 1.5);
+  view.vx = W * CONFIG.camera.vanishX;
+  view.hy = H * CONFIG.camera.horizon;
+  view.f = CONFIG.camera.focal * H;
+  input.x = clamp(input.x, 0, W);
+  input.y = clamp(input.y, 0, H);
+  buildBackground();
+  initMotes();
+}
+
+/* =====================================================================
+   6. STATIC SCENE — golden-hour street, rendered once per resize
+   ===================================================================== */
+function quad(g, pts, fill) {
+  g.beginPath();
+  g.moveTo(pts[0][0], pts[0][1]);
+  for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0], pts[i][1]);
+  g.closePath();
+  g.fillStyle = fill; g.fill();
+}
+
+function buildBackground() {
+  bg = document.createElement('canvas');
+  bg.width = Math.round((W + 2 * PAD) * DPR);
+  bg.height = Math.round((H + 2 * PAD) * DPR);
+  const g = bg.getContext('2d');
+  g.setTransform(DPR, 0, 0, DPR, PAD * DPR, PAD * DPR);
+  const rng = mulberry32(1887);
+  const town = genTown(mulberry32(4242));
+  drawSky(g, rng);
+  drawMesas(g, rng);
+  drawGround(g, rng, town);
+  drawWindmill(g);
+  for (const b of town) drawBuilding(g, b);
+  drawProps(g);
+  drawAtmosphere(g);
+}
+
+function drawSky(g, rng) {
+  const top = -PAD, hy = view.hy;
+  const gr = g.createLinearGradient(0, top, 0, hy);
+  gr.addColorStop(0, '#232544'); gr.addColorStop(0.28, '#5b3f63'); gr.addColorStop(0.55, '#c0664f');
+  gr.addColorStop(0.78, '#ee9d52'); gr.addColorStop(1, '#ffd995');
+  g.fillStyle = gr; g.fillRect(-PAD, top, W + 2 * PAD, hy - top + 2);
+
+  const sx = view.vx + H * 0.062, sy = hy - H * 0.05;
+  view.sun = [sx, sy];
+  const glow = g.createRadialGradient(sx, sy, 0, sx, sy, H * 0.6);
+  glow.addColorStop(0, 'rgba(255,236,180,0.95)'); glow.addColorStop(0.08, 'rgba(255,214,140,0.6)');
+  glow.addColorStop(0.35, 'rgba(255,170,90,0.22)'); glow.addColorStop(1, 'rgba(255,150,80,0)');
+  g.fillStyle = glow; g.fillRect(-PAD, top, W + 2 * PAD, hy - top + 2);
+  g.fillStyle = '#fff6dc'; g.beginPath(); g.arc(sx, sy, H * 0.03, 0, TAU); g.fill();
+
+  // streaky clouds, lit from below
+  for (let i = 0; i < 11; i++) {
+    const cx = -0.1 * W + rng() * W * 1.2, cy = hy - H * (0.1 + rng() * 0.36), w = H * (0.12 + rng() * 0.25);
+    const cg = g.createLinearGradient(0, cy - H * 0.02, 0, cy + H * 0.02);
+    cg.addColorStop(0, 'rgba(110,66,92,0.55)'); cg.addColorStop(1, 'rgba(255,176,112,0.7)');
+    g.fillStyle = cg;
+    for (let j = 0; j < 5; j++) {
+      g.beginPath();
+      g.ellipse(cx + (rng() - 0.5) * w, cy + (rng() - 0.5) * H * 0.012, w * (0.3 + rng() * 0.4), H * (0.005 + rng() * 0.011), 0, 0, TAU);
+      g.fill();
+    }
+  }
+}
+
+function drawMesas(g, rng) {
+  const hy = view.hy;
+  const layer = (col, hMin, hMax, n, spread) => {
+    g.fillStyle = col;
+    for (let i = 0; i < n; i++) {
+      const cx = view.vx + (rng() - 0.5) * H * spread, w = H * (0.08 + rng() * 0.22), h = H * (hMin + rng() * (hMax - hMin));
+      g.beginPath();
+      g.moveTo(cx - w * 0.62, hy + 1); g.lineTo(cx - w * 0.5, hy - h * 0.45); g.lineTo(cx - w * 0.44, hy - h * 0.5);
+      g.lineTo(cx - w * 0.4, hy - h); g.lineTo(cx + w * 0.38, hy - h); g.lineTo(cx + w * 0.43, hy - h * 0.55);
+      g.lineTo(cx + w * 0.52, hy - h * 0.5); g.lineTo(cx + w * 0.64, hy + 1);
+      g.closePath(); g.fill();
+    }
+  };
+  layer('rgba(214,134,98,0.8)', 0.035, 0.075, 7, 2.2);
+  layer('rgba(160,86,72,0.92)', 0.012, 0.035, 6, 1.8);
+}
+
+function genTown(rng) {
+  const list = [];
+  const cols = [[156, 98, 62], [178, 122, 80], [132, 84, 58], [196, 158, 118], [146, 70, 52], [120, 96, 74]];
+  const names = ['SALOON', 'BANK', 'HOTEL', 'GUNSMITH', 'LIVERY', 'ASSAY', 'BARBER', 'DRY GOODS', 'UNDERTAKER', 'TELEGRAPH'];
+  let ni = 0;
+  for (const side of [-1, 1]) {
+    let z = 3.5;
+    while (z < 50) {
+      const depth = 5 + rng() * 4.5, h = 4.6 + rng() * 3.2;
+      list.push({
+        side, z1: z, z2: z + depth, h,
+        col: cols[(rng() * cols.length) | 0],
+        awning: rng() < 0.78,
+        sign: rng() < 0.75 ? names[ni++ % names.length] : null,
+        seed: (rng() * 1e9) | 0,
+      });
+      z += depth + (rng() < 0.3 ? 1.4 + rng() * 1.6 : 0.12);
+    }
+  }
+  list.sort((a, b) => b.z1 - a.z1);            // painter's order: far to near
+  return list;
+}
+
+function drawGround(g, rng, town) {
+  const hy = view.hy, bot = H + PAD;
+  const gr = g.createLinearGradient(0, hy, 0, bot);
+  gr.addColorStop(0, '#f2b76c'); gr.addColorStop(0.12, '#d6945a'); gr.addColorStop(0.5, '#a9693b'); gr.addColorStop(1, '#6c4026');
+  g.fillStyle = gr; g.fillRect(-PAD, hy, W + 2 * PAD, bot - hy);
+
+  // pebbles, scuffs and dust patches
+  for (let i = 0; i < 1300; i++) {
+    const sy = hy + 3 + Math.pow(rng(), 1.6) * (bot - hy - 3);
+    const z = CONFIG.camera.eyeHeight * view.f / (sy - hy);
+    const s = view.f / z, x = (rng() - 0.5) * 14;
+    const size = clamp((0.02 + rng() * 0.05) * s, 0.5, 9);
+    g.fillStyle = rng() < 0.55 ? `rgba(70,36,16,${0.1 + rng() * 0.18})` : `rgba(255,214,150,${0.08 + rng() * 0.14})`;
+    g.beginPath(); g.ellipse(view.vx + x * s, sy, size * (1 + rng() * 2), size * 0.38, 0, 0, TAU); g.fill();
+  }
+
+  // wagon ruts converging on the vanishing point
+  for (const x0 of [-1.05, -0.2, 0.55, 1.4]) {
+    const a = P(x0 - 0.07, 0, 1.1), b = P(x0 + 0.07, 0, 1.1), c2 = P(x0 + 0.07, 0, 70), d = P(x0 - 0.07, 0, 70);
+    quad(g, [a, b, c2, d], 'rgba(72,36,16,0.22)');
+  }
+
+  // long shadows thrown across the street by the right-hand buildings
+  g.beginPath();
+  for (const b of town) {
+    if (b.side < 0) continue;
+    const X = STREET_HALF, k = 1.5 * b.h, zc = z => Math.max(0.9, z);
+    const pts = [P(X, 0, zc(b.z1)), P(X, 0, zc(b.z2)), P(X - 0.4 * k, 0, zc(b.z2 - k)), P(X - 0.4 * k, 0, zc(b.z1 - k))];
+    g.moveTo(pts[0][0], pts[0][1]);
+    for (let i = 1; i < 4; i++) g.lineTo(pts[i][0], pts[i][1]);
+    g.closePath();
+  }
+  g.fillStyle = 'rgba(52,22,40,0.34)'; g.fill();
+}
+
+function drawWindmill(g) {
+  const x = -4.2, z = 82, col = 'rgba(120,62,58,0.85)';
+  const base = P(x, 0, z), top = P(x, 9, z), s = base[2];
+  g.strokeStyle = col; g.lineWidth = Math.max(1, 0.12 * s); g.lineCap = 'round';
+  g.beginPath();
+  g.moveTo(base[0] - 1.3 * s, base[1]); g.lineTo(top[0], top[1]);
+  g.moveTo(base[0] + 1.3 * s, base[1]); g.lineTo(top[0], top[1]);
+  for (let i = 1; i < 4; i++) {
+    const t = i / 4, y = lerp(base[1], top[1], t), w = 1.3 * s * (1 - t);
+    g.moveTo(base[0] - w, y); g.lineTo(base[0] + w, y);
+  }
+  g.stroke();
+  g.lineWidth = Math.max(1, 0.1 * s);
+  g.beginPath();
+  for (let i = 0; i < 12; i++) {
+    const a = i / 12 * TAU + 0.2;
+    g.moveTo(top[0], top[1]); g.lineTo(top[0] + Math.cos(a) * 1.7 * s, top[1] + Math.sin(a) * 1.7 * s);
+  }
+  g.stroke();
+  g.beginPath(); g.arc(top[0], top[1], 1.7 * s, 0, TAU); g.stroke();
+  g.beginPath(); g.moveTo(top[0], top[1]); g.lineTo(top[0] - 3 * s, top[1] - 0.3 * s); g.stroke();
+}
+
+function drawBuilding(g, b) {
+  const side = b.side, X = side * STREET_HALF, z1 = b.z1, z2 = b.z2, h = b.h;
+  const zm = (z1 + z2) / 2, sm = view.f / zm;
+  const hz = clamp((zm - 8) / 60, 0, 0.7);
+  const HAZE = [244, 176, 112], lit = side < 0;
+  const rng = mulberry32(b.seed);
+  const wallC = lit ? mix(b.col, HAZE, hz) : mix(mix(shade(b.col, 0.42), [58, 36, 52], 0.35), HAZE, hz * 0.9);
+  const frontC = mix(mix(shade(b.col, 0.3), [50, 32, 48], 0.4), HAZE, hz * 0.9);
+  const wr = (za, zb, ya, yb) => [P(X, ya, za), P(X, yb, za), P(X, yb, zb), P(X, ya, zb)];
+
+  // face toward the camera (in shadow: the sun is ahead of us)
+  const a = P(X, 0, z1), tb = P(X + side * 9, h, z1);
+  g.fillStyle = rgb(frontC);
+  g.fillRect(Math.min(a[0], tb[0]), tb[1], Math.abs(tb[0] - a[0]), a[1] - tb[1]);
+
+  // street-facing wall
+  quad(g, wr(z1, z2, 0, h), rgb(wallC));
+  g.strokeStyle = rgb(shade(wallC, 0.7), 0.45); g.lineWidth = Math.max(0.5, 0.018 * sm);
+  g.beginPath();
+  for (let y = 0.45; y < h - 0.3; y += 0.42) {
+    const p0 = P(X, y, z1), p1 = P(X, y, z2);
+    g.moveTo(p0[0], p0[1]); g.lineTo(p1[0], p1[1]);
+  }
+  g.stroke();
+  quad(g, wr(z1, z2, h - 0.28, h), rgb(lit ? mix(wallC, [255, 226, 170], 0.3) : shade(wallC, 0.8)));   // cornice
+
+  // doors & windows
+  const n = Math.max(2, Math.floor((z2 - z1) / 2.3)), bay = (z2 - z1) / n, door = n >> 1;
+  const frame = rgb(shade(wallC, 0.55));
+  const opening = (zc, hw, ya, yb, isDoor) => {
+    const isLit = !isDoor && rng() < 0.42;
+    const col = isDoor ? shade(wallC, 0.38) : (isLit ? mix([255, 206, 116], HAZE, hz * 0.5) : mix([34, 24, 30], HAZE, hz));
+    const q = wr(zc - hw, zc + hw, ya, yb);
+    quad(g, q, rgb(col));
+    g.strokeStyle = frame; g.lineWidth = Math.max(0.6, 0.05 * sm); g.stroke();
+    if (isLit) {
+      const cx = (q[0][0] + q[2][0]) / 2, cy = (q[0][1] + q[2][1]) / 2, r = 1.3 * sm;
+      const gl = g.createRadialGradient(cx, cy, 0, cx, cy, r);
+      gl.addColorStop(0, 'rgba(255,196,96,0.3)'); gl.addColorStop(1, 'rgba(255,196,96,0)');
+      g.fillStyle = gl; g.fillRect(cx - r, cy - r, r * 2, r * 2);
+    }
+  };
+  for (let i = 0; i < n; i++) {
+    const zc = z1 + (i + 0.5) * bay;
+    if (i === door) opening(zc, 0.55, 0.22, 2.35, true); else opening(zc, 0.5, 1.15, 2.3, false);
+    if (h > 5.7) opening(zc, 0.42, 3.75, 4.75, false);
+  }
+
+  // boardwalk
+  const xo = X - side * 1.75;
+  quad(g, [P(X, 0.22, z1), P(xo, 0.22, z1), P(xo, 0.22, z2), P(X, 0.22, z2)], rgb(mix(lit ? [150, 106, 68] : [84, 56, 50], HAZE, hz)));
+  quad(g, [P(xo, 0, z1), P(xo, 0.22, z1), P(xo, 0.22, z2), P(xo, 0, z2)], rgb(mix(lit ? [104, 68, 42] : [58, 38, 38], HAZE, hz)));
+
+  if (b.awning) {
+    quad(g, [P(X, 2.95, z1), P(xo, 2.75, z1), P(xo, 2.75, z2), P(X, 2.95, z2)], rgb(mix([52, 32, 28], HAZE, hz * 0.8)));
+    const postC = rgb(mix(lit ? [120, 80, 50] : [46, 30, 30], HAZE, hz));
+    for (const zc of [z2 - 0.15, (z1 + z2) / 2, z1 + 0.15]) {
+      const p0 = P(xo, 0.22, zc), p1 = P(xo, 2.78, zc);
+      g.strokeStyle = postC; g.lineWidth = Math.max(1, 0.13 * p0[2]); g.lineCap = 'butt';
+      g.beginPath(); g.moveTo(p0[0], p0[1]); g.lineTo(p1[0], p1[1]); g.stroke();
+    }
+    quad(g, [P(xo, 2.72, z1), P(xo, 2.98, z1), P(xo, 2.98, z2), P(xo, 2.72, z2)], rgb(mix(lit ? [170, 120, 78] : [66, 44, 42], HAZE, hz)));
+
+    if (b.sign) {      // hanging shingle, facing the camera
+      const zs = z1 + 0.35, pa = P(xo + side * 0.12, 2.62, zs), pb = P(X - side * 0.2, 2.02, zs);
+      const x0 = Math.min(pa[0], pb[0]), w = Math.abs(pb[0] - pa[0]), y0 = pa[1], hh = pb[1] - pa[1];
+      g.fillStyle = rgb(mix([54, 32, 20], HAZE, hz * 0.6)); g.fillRect(x0, y0, w, hh);
+      g.strokeStyle = rgb(mix([204, 164, 104], HAZE, hz * 0.6)); g.lineWidth = Math.max(0.6, 0.03 * pa[2]);
+      g.strokeRect(x0, y0, w, hh);
+      let fs = hh * 0.5;
+      if (fs >= 5) {
+        g.font = `700 ${fs}px ${SERIF}`;
+        const tw = g.measureText(b.sign).width;
+        if (tw > w * 0.88) { fs *= w * 0.88 / tw; g.font = `700 ${fs}px ${SERIF}`; }
+        g.fillStyle = rgb(mix([236, 204, 148], HAZE, hz * 0.5));
+        g.textAlign = 'center'; g.textBaseline = 'middle';
+        g.fillText(b.sign, x0 + w / 2, y0 + hh / 2);
+      }
+    }
+  }
+}
+
+function drawProps(g) {
+  // barrels
+  for (const [x, z] of [[-3.4, 30], [3.5, 24], [-3.5, 18.6], [-3.1, 19.3], [3.4, 11.5], [-3.5, 9]]) {
+    const p = P(x, 0, z), s = p[2], w = 0.32 * s, hh = 0.92 * s, dark = x > 0;
+    g.fillStyle = 'rgba(40,18,25,0.35)';
+    g.beginPath(); g.ellipse(p[0] - 0.25 * s, p[1], 0.55 * s, 0.09 * s, 0, 0, TAU); g.fill();
+    g.fillStyle = dark ? '#4a2c24' : '#8a5630';
+    g.beginPath();
+    g.moveTo(p[0] - w * 0.85, p[1]);
+    g.quadraticCurveTo(p[0] - w * 1.2, p[1] - hh / 2, p[0] - w * 0.85, p[1] - hh);
+    g.lineTo(p[0] + w * 0.85, p[1] - hh);
+    g.quadraticCurveTo(p[0] + w * 1.2, p[1] - hh / 2, p[0] + w * 0.85, p[1]);
+    g.closePath(); g.fill();
+    g.strokeStyle = dark ? '#241616' : '#3c2416'; g.lineWidth = Math.max(0.6, 0.05 * s);
+    g.beginPath();
+    for (const t of [0.22, 0.78]) { g.moveTo(p[0] - w * 1.02, p[1] - hh * t); g.lineTo(p[0] + w * 1.02, p[1] - hh * t); }
+    g.stroke();
+    if (!dark) {
+      g.strokeStyle = 'rgba(255,214,150,0.7)'; g.lineWidth = Math.max(0.6, 0.03 * s);
+      g.beginPath(); g.moveTo(p[0] + w * 0.9, p[1] - hh * 0.95); g.quadraticCurveTo(p[0] + w * 1.22, p[1] - hh / 2, p[0] + w * 0.9, p[1] - hh * 0.05); g.stroke();
+    }
+  }
+  // hitching rail
+  const zs = [16.5, 15.2, 13.9];
+  g.strokeStyle = '#6e4428'; g.lineCap = 'round';
+  for (const z of zs) {
+    const p0 = P(-3.5, 0, z), p1 = P(-3.5, 1.05, z);
+    g.lineWidth = Math.max(1, 0.1 * p0[2]);
+    g.beginPath(); g.moveTo(p0[0], p0[1]); g.lineTo(p1[0], p1[1]); g.stroke();
+  }
+  const r0 = P(-3.5, 1.0, zs[0] + 0.2), r1 = P(-3.5, 1.0, zs[2] - 0.2);
+  g.lineWidth = Math.max(1, 0.08 * r1[2]);
+  g.beginPath(); g.moveTo(r0[0], r0[1]); g.lineTo(r1[0], r1[1]); g.stroke();
+}
+
+function drawAtmosphere(g) {
+  const hy = view.hy;
+  const hz = g.createLinearGradient(0, hy - H * 0.13, 0, hy + H * 0.12);
+  hz.addColorStop(0, 'rgba(255,200,130,0)'); hz.addColorStop(0.52, 'rgba(255,200,130,0.34)'); hz.addColorStop(1, 'rgba(255,200,130,0)');
+  g.fillStyle = hz; g.fillRect(-PAD, hy - H * 0.13, W + 2 * PAD, H * 0.25);
+  const [sx, sy] = view.sun;
+  g.save();
+  g.globalCompositeOperation = 'lighter';
+  const gl = g.createRadialGradient(sx, sy, 0, sx, sy, H * 0.62);
+  gl.addColorStop(0, 'rgba(255,196,110,0.42)'); gl.addColorStop(0.4, 'rgba(255,160,80,0.14)'); gl.addColorStop(1, 'rgba(255,140,60,0)');
+  g.fillStyle = gl; g.fillRect(-PAD, -PAD, W + 2 * PAD, H + 2 * PAD);
+  g.restore();
+}
+
+/* =====================================================================
+   7. INPUT
+   ===================================================================== */
+const input = { x: 0, y: 0, down: false, shift: false };
+
+function setMouse(x, y) { input.x = clamp(x, 0, W); input.y = clamp(y, 0, H); }
+function pressDown() {
+  Sfx.init();
+  input.down = true;
+  const s = STATES[state];
+  if (s.down) s.down();
+}
+function release() {
+  if (!input.down) return;
+  input.down = false;
+  const s = STATES[state];
+  if (s.up) s.up();
+}
+
+canvas.addEventListener('mousedown', e => {
+  if (e.button !== 0) return;
+  e.preventDefault();
+  setMouse(e.clientX, e.clientY);
+  pressDown();
+});
+window.addEventListener('mouseup', e => { if (e.button === 0) release(); });
+window.addEventListener('mousemove', e => {
+  setMouse(e.clientX, e.clientY);
+  if (input.down && !(e.buttons & 1)) release();      // the button came up somewhere we could not see
+});
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+window.addEventListener('blur', () => { input.shift = false; release(); });
+
+// basic touch mapping: touch = left button, no focus
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  const t = e.changedTouches[0];
+  setMouse(t.clientX, t.clientY);
+  pressDown();
+}, { passive: false });
+canvas.addEventListener('touchmove', e => {
+  e.preventDefault();
+  const t = e.changedTouches[0];
+  setMouse(t.clientX, t.clientY);
+}, { passive: false });
+const touchEnd = e => { e.preventDefault(); if (e.touches.length === 0) release(); };
+canvas.addEventListener('touchend', touchEnd, { passive: false });
+canvas.addEventListener('touchcancel', touchEnd, { passive: false });
+
+window.addEventListener('keydown', e => {
+  if (e.key === 'Shift') { input.shift = true; return; }
+  if (e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+  const k = e.key.toLowerCase();
+  if (k !== 'escape') Sfx.init();
+  if (k === ' ') e.preventDefault();
+  if (k === 'r') restart();
+  else if (k === 'm') Sfx.toggleMute();
+  else if (k === 'escape') toMenu();
+  else { const s = STATES[state]; if (s.key) s.key(k); }
+});
+window.addEventListener('keyup', e => { if (e.key === 'Shift') input.shift = false; });
+window.addEventListener('resize', resize);
+
+/* =====================================================================
+   8. DUEL DATA
+   ===================================================================== */
+const NICK = ['"Rattler"', '"Dusty"', '"Coyote"', '"Deacon"', '"Two-Bit"', '"Copperhead"', '"Lonesome"', '"Flint"', '"Gravel"', '"Sidewinder"'];
+const FIRST = ['Amos', 'Eli', 'Jed', 'Silas', 'Cyrus', 'Hollis', 'Ezra', 'Boone', 'Thaddeus', 'Cal'];
+const LAST = ['Kane', 'Crane', 'Mercer', 'Voss', 'Hargrove', 'Pike', 'Tolliver', 'Reyes', 'Blackwood', 'Dunmore'];
+const pick = a => a[(Math.random() * a.length) | 0];
+
+let duel = null;
+const particles = [];
+const sway = { x: 0, y: 0, amp: 0, jx: 0, jy: 0, t: rand(0, 100) };
+const fx = { muzzle: 0, seed: 0, hurt: 0, fade: 0, lb: 0, focusK: 0, honorShown: 0.5, honorFlash: 0 };
+
+function newDuel() {
+  duel = {
+    diff: CONFIG.difficulty[store.diff],
+    name: `${pick(NICK)} ${pick(FIRST)} ${pick(LAST)}`,
+    // stare-down
+    ready: false, stareT: 0, delay: rand(CONFIG.stare.minDelay, CONFIG.stare.maxDelay), tremor: CONFIG.sway.base,
+    // draw
+    early: false, earlyT: 0, drawT: 0, drawFlash: 0,
+    // player
+    drawn: false, drawnT: 0, shotsFired: 0, ammo: CONFIG.player.ammo, cooldown: 0, wounds: 0,
+    focus: 1, focusing: false, dead: false, deathT: 0,
+    kick: { x: 0, y: 0 }, off: { x: 0, y: 0 },
+    // opponent
+    opp: {
+      hp: CONFIG.opponent.hp, wounds: 0, dead: false, disarmed: false, hatOff: false,
+      twitchT: 0, drawP: 0, aimT: 0, firstAt: 1, nextAt: 1, shots: 0, stun: 0, stagger: 0,
+      fall: 0, fallDir: 1, landed: false, flashT: 0, flashSeed: 0, surrenderT: 0,
+    },
+    // result
+    outcome: null, resultT: 0, slowmoT: 0, bannerAt: 0, stingPlayed: false,
+  };
+  particles.length = 0;
+  fx.hurt = 0; fx.muzzle = 0;
+}
+
+function reticlePos() {
+  return {
+    x: clamp(input.x + sway.x + duel.off.x + duel.kick.x, 0, W),
+    y: clamp(input.y + sway.y + duel.off.y + duel.kick.y, 0, H),
+  };
+}
+
+function updateSway(rdt) {
+  let target = duel.tremor * U;
+  if (duel.wounds > 0) target *= CONFIG.sway.woundMult;
+  if (duel.focusing) target *= CONFIG.focus.swayMult;
+  sway.amp += (target - sway.amp) * Math.min(1, rdt * 10);
+  sway.t += rdt;
+  const t = sway.t, A = sway.amp, j = CONFIG.sway.jitter, k = Math.min(1, rdt * 14);
+  sway.jx += (rand(-1, 1) * A * j - sway.jx) * k;
+  sway.jy += (rand(-1, 1) * A * j - sway.jy) * k;
+  sway.x = A * (0.6 * Math.sin(t * 1.9 + 0.3) + 0.3 * Math.sin(t * 3.7 + 1.7) + 0.14 * Math.sin(t * 7.9 + 4.1)) + sway.jx;
+  sway.y = A * (0.6 * Math.sin(t * 1.6 + 2.1) + 0.3 * Math.sin(t * 3.1 + 0.4) + 0.14 * Math.sin(t * 6.7 + 5.3)) + sway.jy;
+}
+
+function addShake(m) { cam.shake = Math.max(cam.shake, m * U); }
+
+/* =====================================================================
+   9. OPPONENT — pose, hit zones, drawing
+   ===================================================================== */
+// Joints in metres, origin at his feet, y up. He faces us: his gun hand is on screen-left.
+function oppPose() {
+  const o = duel.opp, t = clock;
+  const breathe = Math.sin(t * 1.6) * 0.006;
+  const lean = Math.sin(t * 0.7) * 0.008 + o.stagger * 0.05 * Math.sin(t * 11);
+  const p = {
+    lean,
+    footR: [-0.2, 0], footL: [0.2, 0], kneeR: [-0.15, 0.5], kneeL: [0.15, 0.5],
+    hipR: [-0.09, 0.95], hipL: [0.09, 0.95],
+    shR: [-0.2 + lean, 1.44 + breathe], shL: [0.2 + lean, 1.44 + breathe],
+    neck: [lean, 1.5 + breathe], head: [lean * 1.2, 1.63 + breathe],
+    elbL: [0.3 + lean, 1.17], handL: [0.29 + lean * 0.5, 0.92],
+  };
+  const idleE = [-0.32, 1.17], idleH = [-0.33, 0.97], gripE = [-0.37, 1.2], gripH = [-0.25, 0.94];
+  const aimE = [-0.27, 1.24], aimH = [-0.15 + lean, 1.37];
+  let e = idleE, h = idleH;
+  const d = o.drawP;
+  if (d > 0) {
+    if (d < 0.4) { const k = smooth(d / 0.4); e = mix2(idleE, gripE, k); h = mix2(idleH, gripH, k); }
+    else { const k = easeOut((d - 0.4) / 0.6); e = mix2(gripE, aimE, k); h = mix2(gripH, aimH, k); }
+  }
+  if (o.twitchT > 0) {                                   // the tell: his fingers jump
+    const a = o.twitchT / CONFIG.opponent.twitchTime;
+    h = [h[0] - 0.05 * a + Math.sin(t * 70) * 0.02 * a, h[1] + 0.04 * a + Math.sin(t * 55) * 0.02 * a];
+    e = [e[0] - 0.04 * a, e[1] + 0.02 * a];
+  }
+  p.elbR = e; p.handR = h;
+  if (o.disarmed) {                                      // hands up
+    const k = smooth(o.surrenderT / 0.45);
+    p.elbR = mix2(p.elbR, [-0.38, 1.52], k); p.handR = mix2(p.handR, [-0.34, 1.84], k);
+    p.elbL = mix2(p.elbL, [0.38 + lean, 1.52], k); p.handL = mix2(p.handL, [0.34 + lean, 1.84], k);
+  }
+  return p;
+}
+
+const oppFeet = () => P(0, 0, CONFIG.distance);
+
+// world-layer px -> hit zone name (or null)
+function oppHitTest(wx, wy) {
+  const o = duel.opp;
+  if (o.dead || o.disarmed) return null;
+  const [fx0, fy0, s] = oppFeet();
+  const x = (wx - fx0) / s, y = (fy0 - wy) / s;
+  const p = oppPose();
+  if (Math.hypot(x - p.head[0], y - p.head[1]) < 0.115) return 'head';
+  if (!o.hatOff) {
+    const dx = Math.abs(x - p.head[0]), dy = y - p.head[1];
+    if ((dx < 0.13 && dy > 0.06 && dy < 0.27) || (dx < 0.25 && dy > 0.04 && dy < 0.11)) return 'hat';
+  }
+  if (Math.hypot(x - (p.lean + 0.075), y - 1.3) < 0.065) return 'heart';
+  if (distSeg(x, y, p.shR, p.elbR) < 0.058 || distSeg(x, y, p.elbR, p.handR) < 0.058 || Math.hypot(x - p.handR[0], y - p.handR[1]) < 0.07) return 'gunArm';
+  if (Math.abs(x - p.lean) < 0.21 && y > 0.93 && y < 1.5) return 'torso';
+  if (distSeg(x, y, p.shL, p.elbL) < 0.058 || distSeg(x, y, p.elbL, p.handL) < 0.058) return 'arm';
+  if (distSeg(x, y, p.hipR, p.kneeR) < 0.08 || distSeg(x, y, p.kneeR, p.footR) < 0.068) return 'leg';
+  if (distSeg(x, y, p.hipL, p.kneeL) < 0.08 || distSeg(x, y, p.kneeL, p.footL) < 0.068) return 'leg';
+  return null;
+}
+
+function limb(c, a, b, w, col) {
+  c.strokeStyle = col; c.lineWidth = w; c.lineCap = 'round';
+  c.beginPath(); c.moveTo(a[0], a[1]); c.lineTo(b[0], b[1]); c.stroke();
+}
+function dot(c, p, r, col) { c.fillStyle = col; c.beginPath(); c.arc(p[0], p[1], r, 0, TAU); c.fill(); }
+
+function drawHat(c, x, y, col, band) {
+  c.fillStyle = col;
+  c.beginPath(); c.ellipse(x, y, 0.25, 0.035, 0, 0, TAU); c.fill();
+  c.beginPath();
+  c.moveTo(x - 0.13, y); c.lineTo(x - 0.105, y + 0.17); c.quadraticCurveTo(x, y + 0.2, x + 0.105, y + 0.17); c.lineTo(x + 0.13, y);
+  c.closePath(); c.fill();
+  c.fillStyle = band; c.fillRect(x - 0.125, y + 0.018, 0.25, 0.03);
+}
+
+function drawFlash(c, x, y, r, seed) {
+  c.save();
+  c.globalCompositeOperation = 'lighter';
+  const g = c.createRadialGradient(x, y, 0, x, y, r * 2.4);
+  g.addColorStop(0, 'rgba(255,240,200,0.95)'); g.addColorStop(0.3, 'rgba(255,190,90,0.5)'); g.addColorStop(1, 'rgba(255,120,30,0)');
+  c.fillStyle = g; c.beginPath(); c.arc(x, y, r * 2.4, 0, TAU); c.fill();
+  c.fillStyle = 'rgba(255,250,225,0.95)';
+  c.beginPath();
+  const n = 9;
+  for (let i = 0; i < n * 2; i++) {
+    const a = i / (n * 2) * TAU + seed;
+    const rr = i % 2 ? r * 0.3 : r * (0.7 + 0.5 * Math.abs(Math.sin(seed * 13 + i * 7.1)));
+    c.lineTo(x + Math.cos(a) * rr, y + Math.sin(a) * rr);
+  }
+  c.closePath(); c.fill();
+  c.restore();
+}
+
+function drawOppShadow(c) {
+  const o = duel.opp, e = o.fall * o.fall;
+  const a = P(-0.2, 0, CONFIG.distance), b = P(0.2, 0, CONFIG.distance);
+  const k = 1.6 * 1.8;
+  const t1 = P(-0.4 * k - 0.3, 0, CONFIG.distance - k), t2 = P(-0.4 * k + 0.3, 0, CONFIG.distance - k);
+  if (e < 1) {
+    c.fillStyle = `rgba(40,18,25,${0.42 * (1 - e)})`;
+    c.beginPath(); c.moveTo(a[0], a[1]); c.lineTo(b[0], b[1]); c.lineTo(t2[0], t2[1]); c.lineTo(t1[0], t1[1]); c.closePath(); c.fill();
+    if (!o.hatOff) { c.beginPath(); c.ellipse((t1[0] + t2[0]) / 2, t1[1], (t2[0] - t1[0]) * 0.75, a[2] * 0.06, 0, 0, TAU); c.fill(); }
+  }
+  if (e > 0) {
+    c.fillStyle = `rgba(40,18,25,${0.4 * e})`;
+    c.beginPath(); c.ellipse(a[0] + o.fallDir * a[2] * 0.9 + a[2] * 0.2, a[1] + a[2] * 0.03, a[2] * 1.15, a[2] * 0.1, 0, 0, TAU); c.fill();
+  }
+}
+
+function drawOpponent(c) {
+  const o = duel.opp, [fx0, fy0, s] = oppFeet(), p = oppPose();
+  const COAT = '#2e1f1a', SLEEVE = '#3d2a20', PANTS = '#221a18', BOOT = '#120c09', SHIRT = '#8a6a4a', SKIN = '#b97e55';
+  c.save();
+  c.translate(fx0, fy0);
+  if (o.fall > 0) { const e = o.fall * o.fall; c.rotate(e * 1.5 * o.fallDir); }
+  c.scale(s, -s);
+
+  // legs + boots
+  limb(c, p.hipR, p.kneeR, 0.15, PANTS); limb(c, p.kneeR, p.footR, 0.12, PANTS);
+  limb(c, p.hipL, p.kneeL, 0.15, PANTS); limb(c, p.kneeL, p.footL, 0.12, PANTS);
+  limb(c, [p.footR[0], 0.04], [p.footR[0] - 0.07, 0.04], 0.09, BOOT);
+  limb(c, [p.footL[0], 0.04], [p.footL[0] + 0.07, 0.04], 0.09, BOOT);
+
+  // open duster
+  c.fillStyle = COAT;
+  c.beginPath();
+  c.moveTo(p.shR[0] - 0.03, p.shR[1] + 0.04); c.lineTo(p.shL[0] + 0.03, p.shL[1] + 0.04);
+  c.lineTo(0.27 + p.lean * 0.5, 0.6); c.lineTo(0.12, 0.58); c.lineTo(0.07, 0.98);
+  c.lineTo(-0.07, 0.98); c.lineTo(-0.12, 0.58); c.lineTo(-0.27 + p.lean * 0.5, 0.6);
+  c.closePath(); c.fill();
+  // shirt
+  c.fillStyle = SHIRT;
+  c.beginPath(); c.moveTo(p.lean - 0.09, 1.47); c.lineTo(p.lean + 0.09, 1.47); c.lineTo(p.lean + 0.07, 1.0); c.lineTo(p.lean - 0.07, 1.0); c.closePath(); c.fill();
+  // gun belt, buckle, holster
+  limb(c, [-0.2, 0.99], [0.2, 0.95], 0.045, '#4a2f1c');
+  c.fillStyle = '#d8b060'; c.fillRect(p.lean - 0.025, 0.945, 0.05, 0.05);
+  c.fillStyle = '#3a2416'; c.fillRect(-0.3, 0.76, 0.09, 0.22);
+  if (o.drawP < 0.4 && !o.disarmed) { c.fillStyle = '#17171c'; c.fillRect(-0.287, 0.96, 0.055, 0.075); }
+
+  // off arm
+  limb(c, p.shL, p.elbL, 0.11, SLEEVE); limb(c, p.elbL, p.handL, 0.095, SLEEVE); dot(c, p.handL, 0.045, SKIN);
+
+  // neck, head, bandana, hat
+  limb(c, [p.neck[0], 1.47], [p.head[0], 1.56], 0.08, SKIN);
+  dot(c, p.head, 0.105, SKIN);
+  c.fillStyle = 'rgba(40,20,10,0.55)'; c.beginPath(); c.arc(p.head[0], p.head[1], 0.105, 0, Math.PI); c.fill();
+  c.fillStyle = '#9a2a1e';
+  c.beginPath(); c.moveTo(p.neck[0] - 0.09, 1.53); c.lineTo(p.neck[0] + 0.09, 1.53); c.lineTo(p.neck[0], 1.4); c.closePath(); c.fill();
+  if (!o.hatOff) drawHat(c, p.head[0], p.head[1] + 0.07, '#1f1410', '#6b2a1c');
+
+  // gun arm + revolver
+  limb(c, p.shR, p.elbR, 0.11, SLEEVE); limb(c, p.elbR, p.handR, 0.095, SLEEVE); dot(c, p.handR, 0.047, SKIN);
+  if (o.drawP >= 0.4 && !o.disarmed) {
+    const k = easeOut((o.drawP - 0.4) / 0.6), h = p.handR;
+    limb(c, h, [h[0] + 0.01, h[1] - 0.17 * (1 - k)], 0.04, '#141418');     // barrel swings up toward us
+    dot(c, [h[0], h[1] + 0.012], 0.036, '#1c1c22');
+    if (k > 0.8) dot(c, [h[0], h[1] + 0.012], 0.014, '#000');
+  }
+
+  // warm rim light from the low sun (screen-right)
+  c.strokeStyle = 'rgba(255,204,128,0.9)'; c.lineWidth = 0.016; c.lineCap = 'round';
+  c.beginPath();
+  c.moveTo(p.shL[0] + 0.055, p.shL[1] + 0.02); c.lineTo(p.elbL[0] + 0.055, p.elbL[1]); c.lineTo(p.handL[0] + 0.05, p.handL[1]);
+  c.moveTo(0.275 + p.lean * 0.5, 0.62); c.lineTo(0.245, 0.9);
+  c.moveTo(p.footL[0] + 0.065, 0.12); c.lineTo(p.kneeL[0] + 0.07, 0.5);
+  c.stroke();
+  c.beginPath(); c.arc(p.head[0], p.head[1], 0.105, -1.1, 0.5); c.stroke();
+  if (!o.hatOff) { c.beginPath(); c.moveTo(p.head[0] + 0.25, p.head[1] + 0.07); c.lineTo(p.head[0] + 0.13, p.head[1] + 0.09); c.lineTo(p.head[0] + 0.105, p.head[1] + 0.24); c.stroke(); }
+
+  if (o.flashT > 0) drawFlash(c, p.handR[0], p.handR[1] + 0.012, 0.2, o.flashSeed);
+  c.restore();
+}
+
+/* =====================================================================
+   10. PLAYER — over-the-shoulder foreground figure
+   ===================================================================== */
+function drawPlayer(c) {
+  const sp = view.f / PLAYER_Z;
+  const px = view.vx + PLAYER_X * sp, py = view.hy + CONFIG.camera.eyeHeight * sp;
+  const L = (x, y) => [px + x * sp, py - y * sp];
+  const RIM = 'rgba(255,196,118,0.8)';
+
+  c.save();
+  c.translate(px, py); c.scale(sp, -sp);
+
+  // duster, seen from behind
+  const cg = c.createLinearGradient(-0.34, 0, 0.34, 0);
+  cg.addColorStop(0, '#120c0a'); cg.addColorStop(0.7, '#241813'); cg.addColorStop(1, '#3a271b');
+  c.fillStyle = cg;
+  c.beginPath();
+  c.moveTo(-0.27, 1.45); c.quadraticCurveTo(0, 1.54, 0.27, 1.45);
+  c.lineTo(0.3, 1.2); c.lineTo(0.28, 0.95); c.lineTo(0.37, 0.2); c.lineTo(-0.37, 0.2); c.lineTo(-0.28, 0.95); c.lineTo(-0.3, 1.2);
+  c.closePath(); c.fill();
+  c.strokeStyle = 'rgba(0,0,0,0.35)'; c.lineWidth = 0.008;
+  c.beginPath(); c.moveTo(0, 1.46); c.lineTo(0, 0.2); c.stroke();
+
+  // left arm
+  limb(c, [-0.27, 1.4], [-0.35, 1.12], 0.13, '#140d0b'); limb(c, [-0.35, 1.12], [-0.34, 0.86], 0.11, '#140d0b');
+  dot(c, [-0.34, 0.8], 0.05, '#5a3c2a');
+
+  // gun belt with cartridges
+  limb(c, [-0.29, 1.02], [0.3, 0.93], 0.055, '#4a2e1a');
+  for (let i = 0; i < 9; i++) dot(c, [-0.24 + i * 0.055, 1.012 - i * 0.0084], 0.011, '#c9a25a');
+  // holster and, until it is drawn, the revolver's grip
+  c.fillStyle = '#2e1c10';
+  c.beginPath(); c.moveTo(0.27, 0.97); c.lineTo(0.39, 0.95); c.lineTo(0.41, 0.62); c.lineTo(0.31, 0.58); c.closePath(); c.fill();
+  if (!duel.drawn) {
+    c.fillStyle = '#5a3820';
+    c.beginPath(); c.moveTo(0.3, 0.96); c.lineTo(0.37, 0.95); c.lineTo(0.41, 1.05); c.lineTo(0.35, 1.075); c.closePath(); c.fill();
+    dot(c, [0.305, 0.985], 0.016, '#2a2a30');
+  }
+
+  // neck, hair, hat
+  c.fillStyle = '#4f3323'; c.fillRect(-0.055, 1.45, 0.11, 0.11);
+  dot(c, [0, 1.62], 0.105, '#21150f');
+  c.fillStyle = '#2b1c12'; c.beginPath(); c.ellipse(0, 1.69, 0.28, 0.055, 0, 0, TAU); c.fill();
+  c.fillStyle = '#33221a';
+  c.beginPath(); c.moveTo(-0.14, 1.7); c.lineTo(-0.12, 1.9); c.quadraticCurveTo(0, 1.95, 0.12, 1.9); c.lineTo(0.14, 1.7); c.closePath(); c.fill();
+  c.fillStyle = '#120a07'; c.fillRect(-0.137, 1.705, 0.274, 0.036);
+
+  // rim light on the sun side
+  c.strokeStyle = RIM; c.lineWidth = 0.012; c.lineCap = 'round';
+  c.beginPath();
+  c.moveTo(0.14, 1.72); c.lineTo(0.12, 1.9);
+  c.moveTo(0.265, 1.455); c.lineTo(0.3, 1.2); c.lineTo(0.28, 0.95);
+  c.stroke();
+  c.beginPath(); c.ellipse(0, 1.69, 0.28, 0.055, 0, -1.2, 0.6); c.stroke();
+  c.restore();
+
+  // ---- right arm: hovers over the holster, then swings up toward the reticle ----
+  const d = duel.drawn ? smooth(duel.drawnT / CONFIG.player.drawTime) : 0;
+  const tj = clamp((duel.tremor - CONFIG.sway.base) / (CONFIG.sway.max - CONFIG.sway.base), 0, 1);
+  const shakeAmt = (state === 'STARE' || state === 'DRAW') ? 0.3 + tj * 1.7 : 0.2;
+  const jx = (Math.sin(rclock * 31) + Math.sin(rclock * 47 + 1)) * 0.004 * shakeAmt;
+  const jy = (Math.sin(rclock * 23 + 2) + Math.sin(rclock * 53)) * 0.005 * shakeAmt;
+  const S0 = L(0.25, 1.41), E0 = L(0.42, 1.21), H0 = L(0.45 + jx, 1.05 + jy);
+  const rp = reticlePos(), R = screenToFg(rp.x, rp.y);
+  const H1 = [lerp(S0[0], R.x, 0.42), lerp(S0[1], R.y, 0.42) + sp * 0.02];
+  const E1 = [lerp(S0[0], H1[0], 0.5) + sp * 0.05, lerp(S0[1], H1[1], 0.5) + sp * 0.06];
+  const E = mix2(E0, E1, d), Hd = mix2(H0, H1, d);
+
+  limb(c, S0, E, lerp(0.125, 0.115, d) * sp, '#1a120e');
+  limb(c, E, Hd, lerp(0.105, 0.08, d) * sp, '#20150f');
+  if (d < 1) {
+    c.globalAlpha = 1 - d;
+    c.strokeStyle = RIM; c.lineWidth = 0.012 * sp; c.lineCap = 'round';
+    c.beginPath(); c.moveTo(S0[0] + 0.05 * sp, S0[1]); c.lineTo(E[0] + 0.055 * sp, E[1]); c.stroke();
+    c.globalAlpha = 1;
+  }
+
+  const SKIN = '#8a5a3c';
+  if (d < 0.5) {                               // spread fingers, twitching above the grip
+    c.strokeStyle = SKIN; c.lineWidth = 0.02 * sp; c.lineCap = 'round';
+    c.beginPath();
+    for (let i = 0; i < 4; i++) {
+      const tw = Math.sin(rclock * (17 + i * 5) + i) * 0.006 * shakeAmt * sp;
+      c.moveTo(Hd[0] - 0.035 * sp + i * 0.02 * sp, Hd[1] + 0.02 * sp);
+      c.lineTo(Hd[0] - 0.055 * sp + i * 0.022 * sp, Hd[1] + 0.085 * sp + tw);
+    }
+    c.stroke();
+  }
+  let muzzle = null;
+  if (duel.drawn && d > 0.15) {                // revolver, seen from behind
+    const ang = Math.atan2(R.y - Hd[1], R.x - Hd[0]);
+    c.save();
+    c.translate(Hd[0], Hd[1]); c.rotate(ang);
+    c.fillStyle = '#16161a'; c.fillRect(0.045 * sp, -0.013 * sp, 0.1 * sp, 0.026 * sp);        // barrel
+    c.fillStyle = '#26262c'; c.fillRect(0.0, -0.032 * sp, 0.055 * sp, 0.064 * sp);             // cylinder
+    c.fillStyle = '#101013'; c.fillRect(-0.03 * sp, -0.02 * sp, 0.04 * sp, 0.04 * sp);         // frame / hammer
+    c.fillStyle = 'rgba(255,214,150,0.55)'; c.fillRect(0.0, -0.032 * sp, 0.145 * sp, 0.006 * sp);
+    c.restore();
+    muzzle = [Hd[0] + Math.cos(ang) * 0.15 * sp, Hd[1] + Math.sin(ang) * 0.15 * sp];
+  }
+  dot(c, Hd, lerp(0.05, 0.042, d) * sp, SKIN);
+  if (muzzle && fx.muzzle > 0) drawFlash(c, muzzle[0], muzzle[1], 0.085 * sp, fx.seed);
+}
+
+/* =====================================================================
+   11. PARTICLES & AMBIENT LIFE
+   ===================================================================== */
+function makePuff(r, g, b) {
+  const c = document.createElement('canvas'); c.width = c.height = 64;
+  const x = c.getContext('2d');
+  const gr = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+  gr.addColorStop(0, `rgba(${r},${g},${b},1)`); gr.addColorStop(0.5, `rgba(${r},${g},${b},0.45)`); gr.addColorStop(1, `rgba(${r},${g},${b},0)`);
+  x.fillStyle = gr; x.fillRect(0, 0, 64, 64);
+  return c;
+}
+const PUFF_DUST = makePuff(232, 186, 128), PUFF_SMOKE = makePuff(236, 230, 220), PUFF_BLOOD = makePuff(120, 12, 10);
+
+function puff(x, y, o) {
+  particles.push(Object.assign({ kind: 'puff', x, y, vx: 0, vy: 0, grav: 0, life: 0, max: 1, size: 10, grow: 20, alpha: 0.5, sprite: PUFF_DUST, rot: 0, vr: 0, floor: Infinity }, o));
+}
+function spawnBlood(x, y, n) {
+  const s = oppFeet()[2];
+  puff(x, y, { sprite: PUFF_BLOOD, size: 0.07 * s, grow: 0.35 * s, max: 0.5, alpha: 0.7 });
+  for (let i = 0; i < n; i++) {
+    particles.push({
+      kind: 'dot', x, y, vx: rand(-1, 1) * 0.9 * s, vy: rand(-1.5, -0.2) * s, grav: 3.2 * s,
+      life: 0, max: rand(0.4, 0.9), size: Math.max(1, rand(0.012, 0.028) * s), alpha: 0.9, color: 'rgb(112,10,8)', rot: 0, vr: 0, floor: Infinity,
+    });
+  }
+}
+function spawnProp(kind, x, y) {
+  const [, fy0, s] = oppFeet();
+  particles.push({
+    kind, x, y, vx: rand(-1.3, 1.3) * s, vy: rand(-3.2, -2.2) * s, grav: 6 * s,
+    life: 0, max: 600, size: s, alpha: 1, rot: 0, vr: rand(-9, 9), floor: fy0,
+  });
+}
+function spawnImpact(w) {
+  if (w.y > view.hy + 4) {
+    const z = CONFIG.camera.eyeHeight * view.f / (w.y - view.hy), s = view.f / z;
+    puff(w.x, w.y, { size: Math.max(2, 0.1 * s), grow: 0.55 * s, max: 0.8, alpha: 0.55, vy: -0.25 * s });
+  } else {
+    puff(w.x, w.y, { sprite: PUFF_SMOKE, size: 2 * U, grow: 26 * U, max: 0.35, alpha: 0.5 });
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life += dt;
+    if (p.life >= p.max) { particles.splice(i, 1); continue; }
+    p.vy += p.grav * dt; p.x += p.vx * dt; p.y += p.vy * dt; p.rot += p.vr * dt;
+    if (p.kind === 'puff') p.size += p.grow * dt;
+    if (p.y >= p.floor) { p.y = p.floor; p.vx = p.vy = p.vr = p.grav = 0; p.rot = p.kind === 'gun' ? 1.4 : 0; }
+  }
+}
+function drawParticles(c) {
+  for (const p of particles) {
+    if (p.kind === 'puff') {
+      c.globalAlpha = p.alpha * (1 - p.life / p.max);
+      c.drawImage(p.sprite, p.x - p.size, p.y - p.size, p.size * 2, p.size * 2);
+    } else if (p.kind === 'dot') {
+      c.globalAlpha = p.alpha * (1 - p.life / p.max);
+      c.fillStyle = p.color; c.beginPath(); c.arc(p.x, p.y, p.size, 0, TAU); c.fill();
+    } else {
+      c.globalAlpha = 1;
+      c.save(); c.translate(p.x, p.y); c.rotate(p.rot); c.scale(p.size, -p.size);
+      if (p.kind === 'hat') drawHat(c, 0, 0, '#1f1410', '#6b2a1c');
+      else { c.fillStyle = '#141418'; c.fillRect(-0.09, 0, 0.18, 0.04); c.fillRect(-0.09, -0.07, 0.045, 0.08); }
+      c.restore();
+    }
+  }
+  c.globalAlpha = 1;
+}
+
+// drifting motes of dust in the light
+let motes = [];
+function initMotes() {
+  motes = [];
+  for (let i = 0; i < 46; i++) motes.push({ x: rand(0, W), y: rand(H * 0.2, H), r: rand(1, 3.2) * U, a: rand(0.1, 0.34), vx: rand(6, 22) * U, vy: rand(-4, 4) * U, ph: rand(0, TAU) });
+}
+function updateMotes(dt) {
+  for (const m of motes) {
+    m.x += (m.vx + 8 * U * Math.sin(clock * 0.4 + m.ph)) * dt;
+    m.y += (m.vy + 5 * U * Math.sin(clock * 0.7 + m.ph * 2)) * dt;
+    if (m.x > W + 10) m.x = -10;
+    if (m.y < H * 0.15) m.y = H; else if (m.y > H + 5) m.y = H * 0.2;
+  }
+}
+function drawMotes(c) {
+  c.save(); c.globalCompositeOperation = 'lighter';
+  for (const m of motes) { c.globalAlpha = m.a; c.drawImage(PUFF_DUST, m.x - m.r * 2, m.y - m.r * 2, m.r * 4, m.r * 4); }
+  c.restore();
+}
+
+// an occasional tumbleweed
+const weed = { active: false, x: 0, z: 10, t: 0, next: rand(5, 12), dir: 1, rot: 0 };
+function updateWeed(dt) {
+  if (!weed.active) {
+    weed.next -= dt;
+    if (weed.next <= 0) { weed.active = true; weed.dir = Math.random() < 0.5 ? 1 : -1; weed.x = -weed.dir * 7.5; weed.z = rand(8, 13); weed.t = 0; }
+    return;
+  }
+  weed.t += dt; weed.x += weed.dir * 2.7 * dt; weed.rot += weed.dir * 4.2 * dt;
+  if (Math.abs(weed.x) > 7.6) { weed.active = false; weed.next = rand(14, 30); }
+}
+function drawWeed(c) {
+  if (!weed.active) return;
+  const hop = Math.abs(Math.sin(weed.t * 3.1)) * 0.28;
+  const g0 = P(weed.x, 0, weed.z), p = P(weed.x, 0.3 + hop, weed.z), s = p[2], r = 0.3 * s;
+  c.fillStyle = 'rgba(40,18,25,0.3)';
+  c.beginPath(); c.ellipse(g0[0] - 0.3 * s, g0[1], r * 1.1, r * 0.22, 0, 0, TAU); c.fill();
+  c.save(); c.translate(p[0], p[1]); c.rotate(weed.rot);
+  c.strokeStyle = 'rgba(104,72,38,0.9)'; c.lineWidth = Math.max(0.7, 0.02 * s);
+  for (let i = 0; i < 9; i++) {
+    c.beginPath();
+    c.ellipse(Math.sin(i * 2.3) * r * 0.22, Math.cos(i * 1.7) * r * 0.22, r * (0.55 + 0.4 * Math.abs(Math.sin(i * 3.1))), r * (0.4 + 0.5 * Math.abs(Math.cos(i * 1.3))), i * 0.7, 0, TAU);
+    c.stroke();
+  }
+  c.restore();
+}
+
+/* =====================================================================
+   12. DUEL LOGIC — drawing, firing, hits, the opponent's AI
+   ===================================================================== */
+function playerDraw() {
+  if (duel.drawn) return;
+  duel.drawn = true; duel.drawnT = 0;
+  duel.off.x = rand(-50, 50) * U; duel.off.y = rand(120, 170) * U;   // the gun comes up from the hip
+  Sfx.cock();
+}
+
+function playerFire() {
+  if (!duel.drawn || duel.outcome || duel.cooldown > 0) return;
+  if (duel.ammo <= 0) { Sfx.dry(); duel.cooldown = 0.2; return; }
+  const r = reticlePos(), w = screenToWorld(r.x, r.y);     // sample the aim before recoil and shake move it
+  duel.ammo--; duel.shotsFired++; duel.cooldown = CONFIG.player.fireCooldown;
+  fx.muzzle = 0.07; fx.seed = Math.random() * 10;
+  addShake(CONFIG.fx.shakeShot);
+  duel.kick.x += rand(-0.35, 0.35) * CONFIG.player.recoil * U;
+  duel.kick.y -= CONFIG.player.recoil * U;
+  Sfx.shot(false);
+  resolvePlayerShot(oppHitTest(w.x, w.y), w);
+}
+
+function killOpponent(w) {
+  const o = duel.opp;
+  o.dead = true; o.hp = 0;
+  o.fallDir = w.x < oppFeet()[0] ? 1 : -1;
+  addShake(CONFIG.fx.shakeHit * 0.6);
+}
+
+function resolvePlayerShot(zone, w) {
+  const o = duel.opp, Hn = CONFIG.honor, hm = duel.diff.honorMult;
+  const lethalZone = zone === 'head' || zone === 'heart';
+
+  if (zone === 'hat') { o.hatOff = true; spawnProp('hat', w.x, w.y); zone = null; }
+  else if (zone) { spawnBlood(w.x, w.y, lethalZone ? 14 : 7); Sfx.thud(false); }
+  else spawnImpact(w);
+
+  if (duel.early) {                    // he had not drawn: this shot is dishonorable whatever it hits
+    if (lethalZone) killOpponent(w);
+    else if (zone) { o.wounds++; o.stagger = 1; }
+    finish({ won: false, reason: 'Dishonorable — you fired before he drew', honor: Hn.dishonor, slowmo: o.dead });
+    return;
+  }
+
+  if (lethalZone) {
+    killOpponent(w);
+    finish({ won: true, reason: zone === 'head' ? 'A clean shot, right between the eyes' : 'A clean shot, straight through the heart', honor: Math.round(Hn.cleanKill * hm), slowmo: true });
+  } else if (zone === 'gunArm') {
+    o.disarmed = true; o.surrenderT = 0; o.wounds++;
+    const [fx0, fy0, s] = oppFeet(), p = oppPose();
+    spawnProp('gun', fx0 + p.handR[0] * s, fy0 - p.handR[1] * s);
+    finish({ won: true, reason: 'You shot the iron out of his hand — he yields', honor: Math.round(Hn.disarm * hm), slowmo: true });
+  } else if (zone) {                   // torso or limb: a wound that slows him and spoils his aim
+    o.hp -= zone === 'torso' ? 2 : 1;
+    o.wounds++; o.stagger = 1;
+    o.stun = Math.min(1.2, o.stun + CONFIG.opponent.woundDelay);
+    if (o.hp <= 0) {
+      killOpponent(w);
+      finish({ won: true, reason: 'He went down hard, but it was fair', honor: Math.round(Hn.messyKill * hm), slowmo: true });
+    }
+  }
+}
+
+function opponentFire() {
+  const o = duel.opp, d = duel.diff;
+  o.shots++; o.flashT = 0.08; o.flashSeed = Math.random() * 10;
+  Sfx.shot(true); addShake(4);
+  const acc = clamp(d.accuracy * Math.pow(CONFIG.opponent.woundAccMult, o.wounds) + CONFIG.opponent.accRampPerShot * (o.shots - 1), 0.05, 0.95);
+  if (Math.random() < acc) {
+    fx.hurt = 1;
+    Sfx.thud(true);
+    const lethal = Math.random() < d.lethal || duel.wounds + 1 >= CONFIG.player.wounds;
+    if (lethal) {
+      duel.dead = true;
+      addShake(CONFIG.fx.shakeHit);
+      const reason = !duel.drawn ? 'You never cleared leather'
+        : duel.shotsFired === 0 ? `${duel.name} beat you to the trigger`
+        : `${duel.name} shot straighter`;
+      finish({ won: false, reason, honor: 0, slowmo: true });
+    } else {
+      duel.wounds++;
+      addShake(CONFIG.fx.shakeHit * 0.7);
+    }
+  } else {
+    Sfx.whiz();
+    puff(rand(W * 0.25, W * 0.9), H * rand(0.72, 0.92), { size: 26 * U, grow: 170 * U, max: 0.7, alpha: 0.32, vy: -30 * U });
+  }
+}
+
+function finish(out) {
+  if (duel.outcome) return;
+  duel.outcome = out;
+  const before = store.honor;
+  store.honor = clamp(store.honor + (out.honor || 0), CONFIG.honor.min, CONFIG.honor.max);
+  out.honorDelta = Math.round(store.honor - before);
+  if (out.won) store.wins++; else store.losses++;
+  saveStore();
+  fx.honorFlash = 1;
+  setState('RESULT');
+}
+
+/* =====================================================================
+   13. STATE MACHINE — INTRO → STARE → DRAW → RESULT → REMATCH
+   ===================================================================== */
+let state = 'INTRO', stateT = 0;
+
+function setState(n) {
+  state = n; stateT = 0;
+  const s = STATES[n];
+  if (s.enter) s.enter();
+}
+function startDuel() { newDuel(); setState('STARE'); }
+
+// walking away from a duel in progress counts as a loss
+function abandonIfLive() {
+  if (!duel.outcome && ((state === 'STARE' && duel.ready) || state === 'DRAW')) { store.losses++; saveStore(); }
+}
+function restart() {
+  if (state === 'REMATCH') return;
+  abandonIfLive();
+  if (state === 'INTRO') startDuel(); else setState('REMATCH');
+}
+function toMenu() {
+  if (state === 'INTRO') return;
+  abandonIfLive();
+  newDuel(); fx.fade = 0;
+  setState('INTRO');
+}
+function pickDifficulty(k) {
+  const key = Object.keys(CONFIG.difficulty)[+k - 1];
+  if (key) { store.diff = key; saveStore(); }
+}
+
+const STATES = {
+  INTRO: {
+    down() {
+      const b = menuButtons().find(b => inRect(b));
+      if (b) { store.diff = b.key; saveStore(); startDuel(); }
+    },
+    key(k) {
+      if (k === '1' || k === '2' || k === '3') pickDifficulty(k);
+      else if (k === 'enter' || k === ' ') startDuel();
+    },
+  },
+
+  STARE: {
+    update(dt) {
+      if (!duel.ready) return;
+      duel.stareT += dt;
+      duel.tremor = Math.min(CONFIG.sway.max, CONFIG.sway.base + CONFIG.sway.growthPerSec * duel.stareT);
+      if (duel.stareT >= duel.delay) setState('DRAW');
+    },
+    down() {
+      if (duel.ready) return;
+      duel.ready = true; duel.stareT = 0;
+      duel.delay = rand(CONFIG.stare.minDelay, CONFIG.stare.maxDelay);
+    },
+    up() {
+      if (!duel.ready) return;
+      if (duel.stareT < CONFIG.stare.graceRelease) {       // a stray click, not a lost nerve
+        duel.ready = false; duel.stareT = 0; duel.tremor = CONFIG.sway.base;
+        return;
+      }
+      duel.early = true;                                   // gun comes out before he has moved
+      playerDraw();
+      setState('DRAW');
+    },
+  },
+
+  DRAW: {
+    enter() {
+      duel.drawT = 0;
+      if (duel.early) return;
+      const o = duel.opp, r = duel.diff.reaction;
+      o.twitchT = CONFIG.opponent.twitchTime;
+      o.firstAt = rand(r[0], r[1]); o.nextAt = o.firstAt;
+      duel.drawFlash = 0.9;
+      Sfx.sting();
+    },
+    update(dt) {
+      duel.drawT += dt;
+      if (duel.early) {
+        duel.earlyT += dt;
+        if (duel.earlyT >= CONFIG.stare.forfeitWindow) {
+          finish({ won: false, reason: 'You broke the stare-down — forfeit', honor: CONFIG.honor.forfeit, slowmo: false });
+        }
+        return;
+      }
+      const o = duel.opp;
+      if (o.dead || o.disarmed) return;
+      if (o.stun > 0) o.stun -= dt; else o.aimT += dt;
+      o.drawP = o.shots === 0 ? clamp(o.aimT / o.firstAt, 0, 1) : 1;
+      if (o.aimT >= o.nextAt) {
+        o.nextAt = o.aimT + duel.diff.refire * rand(0.9, 1.15);
+        opponentFire();
+      }
+    },
+    up() { playerDraw(); },                                // release: pull iron
+    down() { if (duel.drawn) playerFire(); else playerDraw(); },   // click: fire
+  },
+
+  RESULT: {
+    enter() {
+      const o = duel.outcome;
+      duel.resultT = 0;
+      duel.slowmoT = o.slowmo ? CONFIG.fx.slowmoTime : 0;
+      duel.bannerAt = o.slowmo ? CONFIG.fx.slowmoTime * 0.7 : CONFIG.fx.bannerDelay;
+      duel.focusing = false;
+      if (o.slowmo) Sfx.slowmo();
+    },
+    update(dt, rdt) {
+      duel.resultT += rdt;
+      duel.slowmoT = Math.max(0, duel.slowmoT - rdt);
+      if (!duel.stingPlayed && duel.resultT >= duel.bannerAt) {
+        duel.stingPlayed = true;
+        if (duel.outcome.won) Sfx.win(); else Sfx.lose();
+      }
+    },
+    canRematch: () => duel.resultT > duel.bannerAt + 0.6,
+    down() { if (STATES.RESULT.canRematch()) setState('REMATCH'); },
+    key(k) {
+      if (k === '1' || k === '2' || k === '3') pickDifficulty(k);
+      else if ((k === 'enter' || k === ' ') && STATES.RESULT.canRematch()) setState('REMATCH');
+    },
+  },
+
+  REMATCH: {
+    update() {
+      fx.fade = Math.min(1, stateT / 0.35);
+      if (stateT >= 0.35) startDuel();
+    },
+  },
+};
+
+/* =====================================================================
+   14. PER-FRAME UPDATE
+   ===================================================================== */
+let clock = 0, rclock = 0, timeScale = 1, lastTs = 0;
+
+function computeTimeScale() {
+  if (state === 'RESULT' && duel.slowmoT > 0) return lerp(1, CONFIG.fx.slowmoScale, smooth(duel.slowmoT / 0.45));
+  return 1;
+}
+
+function updatePlayer(dt, rdt) {
+  if (duel.drawn) duel.drawnT += rdt;
+  duel.cooldown = Math.max(0, duel.cooldown - dt);
+  const offK = Math.exp(-rdt / (CONFIG.player.drawTime / 3)), kickK = Math.exp(-rdt * 9);
+  duel.off.x *= offK; duel.off.y *= offK;
+  duel.kick.x *= kickK; duel.kick.y *= kickK;
+
+  // focus: hold Shift to steady the reticle; the meter drains while it is engaged
+  const F = CONFIG.focus;
+  const want = input.shift && state === 'DRAW' && duel.drawn && !duel.outcome;
+  if (want && duel.focus > 0 && (duel.focusing || duel.focus >= F.minToEngage)) {
+    duel.focusing = true;
+    duel.focus = Math.max(0, duel.focus - F.drainPerSec * rdt);
+  } else {
+    duel.focusing = false;
+    if (!input.shift) duel.focus = Math.min(1, duel.focus + F.regenPerSec * rdt);
+  }
+  if (duel.dead) duel.deathT = Math.min(1, duel.deathT + dt / 1.1);
+}
+
+function updateOpponentAnim(dt) {
+  const o = duel.opp;
+  o.twitchT = Math.max(0, o.twitchT - dt);
+  o.flashT = Math.max(0, o.flashT - dt);
+  o.stagger = Math.max(0, o.stagger - dt * 1.6);
+  if (o.disarmed) o.surrenderT += dt;
+  if (o.dead) {
+    o.fall = Math.min(1, o.fall + dt / 0.85);
+    if (o.fall >= 1 && !o.landed) {
+      o.landed = true;
+      const [fx0, fy0, s] = oppFeet();
+      puff(fx0 + o.fallDir * s * 0.9, fy0, { size: 0.3 * s, grow: 1.2 * s, max: 1.1, alpha: 0.5, vy: -0.15 * s });
+      Sfx.thud(true);
+    }
+  }
+}
+
+function updateFx(dt, rdt) {
+  fx.muzzle = Math.max(0, fx.muzzle - dt);
+  fx.hurt = Math.max(0, fx.hurt - rdt * 0.8);
+  fx.honorFlash = Math.max(0, fx.honorFlash - rdt * 0.5);
+  duel.drawFlash = Math.max(0, duel.drawFlash - rdt);
+  if (state !== 'REMATCH') fx.fade = Math.max(0, fx.fade - rdt * 2.6);
+  const k = Math.min(1, rdt * 6);
+  fx.lb += ((state === 'INTRO' ? 0 : 1) - fx.lb) * k;
+  fx.focusK += ((duel.focusing ? 1 : 0) - fx.focusK) * Math.min(1, rdt * 10);
+  fx.honorShown += (store.honor / CONFIG.honor.max - fx.honorShown) * Math.min(1, rdt * 4);
+
+  // camera: slow push-in as tension rises, a punch-in on the winning shot
+  let zt = 1;
+  if (state === 'STARE' && duel.ready) zt = 1 + 0.035 * clamp(duel.stareT / CONFIG.stare.maxDelay, 0, 1);
+  else if (state === 'DRAW') zt = 1.06;
+  else if (state === 'RESULT') zt = duel.slowmoT > 0 && duel.outcome.won ? 1.2 : 1.05;
+  cam.zoom += (zt - cam.zoom) * Math.min(1, rdt * 5);
+  cam.shake *= Math.exp(-rdt * 9);
+  if (cam.shake < 0.05) cam.shake = 0;
+  const breath = duel.drawn ? 0 : 0.12;                    // the tremor shows in the camera until the gun is out
+  cam.shx = rand(-1, 1) * cam.shake + sway.x * breath;
+  cam.shy = rand(-1, 1) * cam.shake + sway.y * breath;
+}
+
+function audioParams() {
+  const p = { tension: 0.12, music: 0.6, heart: false, bpm: 64, heartVol: 0.6, pluck: true, pluckGap: 2.6 };
+  if (state === 'STARE') {
+    if (duel.ready) {
+      const k = clamp(duel.stareT / CONFIG.stare.maxDelay, 0, 1);
+      p.tension = 0.3 + 0.6 * k; p.heart = true; p.bpm = 66 + 50 * k; p.heartVol = 0.5 + 0.5 * k; p.pluckGap = 1.5 - 0.6 * k;
+    } else { p.tension = 0.2; p.pluckGap = 2.2; }
+  } else if (state === 'DRAW') {
+    p.tension = 1; p.heart = true; p.bpm = 132; p.heartVol = 1; p.pluck = false;
+  } else if (state === 'RESULT') {
+    p.tension = duel.slowmoT > 0 ? 0.6 : 0.1; p.heart = duel.slowmoT > 0; p.bpm = 52; p.heartVol = 1; p.pluck = false; p.music = 0.5;
+  } else if (state === 'REMATCH') { p.tension = 0.1; p.pluck = false; }
+  if (duel.focusing) p.heartVol *= 1.3;
+  return p;
+}
+
+function update(dt, rdt) {
+  stateT += rdt;
+  const s = STATES[state];
+  if (s.update) s.update(dt, rdt);
+  updatePlayer(dt, rdt);
+  updateSway(rdt);
+  updateOpponentAnim(dt);
+  updateParticles(dt);
+  updateMotes(dt);
+  updateWeed(dt);
+  updateFx(dt, rdt);
+  Sfx.update(audioParams());
+}
+
+/* =====================================================================
+   15. HUD, OVERLAYS & POST EFFECTS
+   ===================================================================== */
+function text(c, str, x, y, size, o = {}) {
+  size = Math.max(6, size);
+  c.font = `${o.style || ''} ${o.weight || 700} ${size}px ${SERIF}`;
+  c.textAlign = o.align || 'center'; c.textBaseline = 'middle';
+  if (HAS_LS) c.letterSpacing = (o.spacing || 0) + 'px';
+  c.globalAlpha = o.alpha === undefined ? 1 : clamp(o.alpha, 0, 1);
+  if (o.shadow) { c.shadowColor = 'rgba(0,0,0,0.7)'; c.shadowBlur = size * 0.25; c.shadowOffsetY = size * 0.06; }
+  if (o.stroke) {
+    c.lineJoin = 'round'; c.lineWidth = o.strokeW || Math.max(2, size * 0.16);
+    c.strokeStyle = o.stroke; c.strokeText(str, x, y);
+  }
+  c.shadowColor = 'transparent'; c.shadowBlur = 0; c.shadowOffsetY = 0;
+  c.fillStyle = o.color || '#f3e3c3';
+  c.fillText(str, x, y);
+  c.globalAlpha = 1;
+  if (HAS_LS) c.letterSpacing = '0px';
+}
+const INK = 'rgba(22,9,4,0.75)';
+
+function ornament(c, cx, y, w, col, alpha) {
+  c.save();
+  c.globalAlpha = alpha === undefined ? 1 : alpha;
+  c.strokeStyle = col; c.fillStyle = col; c.lineWidth = Math.max(1, 1.5 * S);
+  const d = 6 * S;
+  c.beginPath();
+  c.moveTo(cx - w / 2, y); c.lineTo(cx - d * 2, y); c.moveTo(cx + d * 2, y); c.lineTo(cx + w / 2, y);
+  c.stroke();
+  c.beginPath(); c.moveTo(cx - d, y); c.lineTo(cx, y - d); c.lineTo(cx + d, y); c.lineTo(cx, y + d); c.closePath(); c.fill();
+  c.restore();
+}
+
+function menuButtons() {
+  const keys = Object.keys(CONFIG.difficulty);
+  const gap = 14 * S, bw = Math.min(215 * S, (W - 32 - gap * 2) / 3), bh = 66 * S;
+  const x0 = (W - (bw * 3 + gap * 2)) / 2, y = H * 0.55;
+  return keys.map((k, i) => ({ key: k, x: x0 + i * (bw + gap), y, w: bw, h: bh }));
+}
+const inRect = b => input.x >= b.x && input.x <= b.x + b.w && input.y >= b.y && input.y <= b.y + b.h;
+
+function drawMenu(c) {
+  c.fillStyle = 'rgba(12,5,3,0.56)'; c.fillRect(0, 0, W, H);
+  const cx = W / 2, ts = Math.min(W * 0.1, 96 * S), ty = H * 0.25;
+  text(c, 'SUNDOWN DUEL', cx, ty, ts, { color: '#f2cf7c', stroke: '#3a1608', strokeW: ts * 0.1, spacing: ts * 0.05, shadow: true });
+  ornament(c, cx, ty + ts * 0.74, Math.min(W * 0.6, 480 * S), '#d8b470');
+  text(c, 'Fifteen metres of dust. One of you walks away.', cx, ty + ts * 0.74 + 28 * S, 19 * S, { style: 'italic', weight: 400, color: '#ead7b0', stroke: INK });
+
+  text(c, 'CHOOSE YOUR OPPONENT', cx, H * 0.55 - 22 * S, 12 * S, { spacing: 4 * S, weight: 400, color: '#d9c193' });
+  menuButtons().forEach((b, i) => {
+    const hov = inRect(b), sel = store.diff === b.key, d = CONFIG.difficulty[b.key];
+    c.fillStyle = hov ? 'rgba(120,52,22,0.9)' : 'rgba(40,20,12,0.82)';
+    c.fillRect(b.x, b.y, b.w, b.h);
+    c.strokeStyle = sel || hov ? '#f2cf7c' : 'rgba(216,180,112,0.45)'; c.lineWidth = sel ? 2.5 * S : 1.2 * S;
+    c.strokeRect(b.x, b.y, b.w, b.h);
+    text(c, d.label.toUpperCase(), b.x + b.w / 2, b.y + b.h * 0.36, Math.min(21 * S, b.w * 0.13), { color: sel || hov ? '#ffe2a0' : '#e8d2a4', spacing: 2 * S });
+    text(c, `${i + 1} · ${d.blurb}`, b.x + b.w / 2, b.y + b.h * 0.72, Math.min(12.5 * S, b.w * 0.075), { weight: 400, style: 'italic', color: '#cdb68a' });
+  });
+
+  const lines = [
+    'HOLD LEFT MOUSE to stand ready. Let go before he moves and you forfeit.',
+    'When he draws: RELEASE to pull iron, move the mouse to aim, CLICK to fire.',
+    'SHIFT steadies your hand but drains Focus.   R restart  ·  M mute  ·  ESC menu',
+    'Head or heart kills. Limbs wound. Hit his gun hand to disarm. Shooting first is dishonorable.',
+  ];
+  const fs = Math.min(15 * S, W / 62), y0 = H * 0.55 + 66 * S + 34 * S;
+  lines.forEach((l, i) => text(c, l, cx, y0 + i * fs * 1.6, fs, { weight: 400, color: i === 3 ? '#cdb68a' : '#eadcbc', stroke: INK }));
+}
+
+function drawBanner(c) {
+  const o = duel.outcome, t = duel.resultT - duel.bannerAt;
+  if (t < 0) return;
+  const a = clamp(t / 0.25, 0, 1), k = easeOutBack(t / 0.5);
+  const cx = W / 2, cy = H * 0.36, size = Math.min(W * 0.115, 120 * S);
+  const title = o.won ? 'DUEL WON' : 'DUEL LOST';
+
+  const band = c.createLinearGradient(0, 0, W, 0);
+  band.addColorStop(0, 'rgba(8,3,2,0)'); band.addColorStop(0.25, 'rgba(8,3,2,0.72)');
+  band.addColorStop(0.75, 'rgba(8,3,2,0.72)'); band.addColorStop(1, 'rgba(8,3,2,0)');
+  c.globalAlpha = a; c.fillStyle = band; c.fillRect(0, cy - size * 0.95, W, size * 1.97 + 110 * S); c.globalAlpha = 1;
+
+  c.save();
+  c.translate(cx, cy); const sc = lerp(1.6, 1, k); c.scale(sc, sc);
+  const col = o.won ? '#f2cf7c' : '#c9291c', edge = o.won ? '#3a1608' : '#1a0503';
+  text(c, title, 0, 0, size, { color: col, stroke: edge, strokeW: size * 0.09, spacing: size * 0.06, alpha: a, shadow: true });
+  const rw = Math.min(W * 0.8, size * 6.4);
+  ornament(c, 0, -size * 0.66, rw, col, a); ornament(c, 0, size * 0.66, rw, col, a);
+  c.restore();
+
+  const a2 = clamp((t - 0.25) / 0.3, 0, 1);
+  text(c, o.reason, cx, cy + size * 1.02, Math.min(23 * S, W / 34), { style: 'italic', weight: 400, color: '#f0dfc0', alpha: a2 });
+  if (o.honorDelta) {
+    text(c, `${o.honorDelta > 0 ? '+' : '−'}${Math.abs(o.honorDelta)} HONOR`, cx, cy + size * 1.02 + 30 * S, 16 * S,
+      { color: o.honorDelta > 0 ? '#f2cf7c' : '#e0584a', spacing: 3 * S, alpha: a2 });
+  }
+  if (t > 0.6) {
+    const pa = 0.6 + 0.4 * Math.sin(rclock * 4);
+    text(c, 'CLICK  or  R  —  REMATCH', cx, cy + size * 1.02 + 66 * S, 17 * S, { spacing: 3 * S, alpha: pa, color: '#ffe9bd', stroke: INK });
+    text(c, '1 · 2 · 3  difficulty      ESC  menu', cx, cy + size * 1.02 + 92 * S, 12.5 * S, { weight: 400, color: '#cdb68a', spacing: 1.5 * S, stroke: INK });
+  }
+}
+
+function drawOverlay(c) {
+  const cx = W / 2, hintY = H * (1 - CONFIG.fx.letterbox) - 20 * S;
+  if (state === 'INTRO') { drawMenu(c); return; }
+
+  if (state === 'STARE') {
+    const a = clamp(stateT / 0.5, 0, 1) * clamp((3.4 - stateT) / 0.6, 0, 1);
+    if (a > 0) {
+      text(c, 'YOUR OPPONENT', cx, H * 0.125, 12 * S, { alpha: a * 0.9, spacing: 4 * S, weight: 400, color: '#f0dcb0', stroke: INK });
+      text(c, duel.name, cx, H * 0.125 + 27 * S, 27 * S, { alpha: a, stroke: INK, color: '#ffe9bd' });
+    }
+    if (!duel.ready) {
+      text(c, 'HOLD LEFT MOUSE BUTTON TO STAND READY', cx, hintY, 17 * S, { alpha: 0.65 + 0.35 * Math.sin(rclock * 4), spacing: 2 * S, stroke: INK, color: '#ffe9bd' });
+    } else {
+      text(c, 'HOLD STEADY — WAIT FOR HIS MOVE', cx, hintY, 14 * S, { alpha: clamp(2 - duel.stareT, 0, 1) * 0.9, spacing: 2 * S, weight: 400, stroke: INK });
+    }
+  } else if (state === 'DRAW') {
+    if (duel.early) {
+      text(c, 'YOU BROKE THE STARE', cx, H * 0.24, Math.min(46 * S, W / 16), { color: '#e0584a', stroke: '#1a0503', spacing: 3 * S, alpha: clamp(duel.earlyT / 0.15, 0, 1) });
+      text(c, 'FORFEIT — HOLSTER IT, OR SHOOT AND BE DAMNED', cx, hintY, 14 * S, { spacing: 2 * S, weight: 400, stroke: INK });
+    } else {
+      if (duel.drawFlash > 0) {
+        const k = 1 - duel.drawFlash / 0.9, size = Math.min(92 * S, W / 7) * (1 + k * 0.3);
+        text(c, 'DRAW!', cx, H * 0.24, size, { color: '#ffe19a', stroke: '#5a1408', strokeW: size * 0.09, spacing: size * 0.08, alpha: clamp(duel.drawFlash / 0.35, 0, 1), shadow: true });
+      }
+      const hint = duel.drawn ? 'CLICK TO FIRE   ·   HOLD SHIFT TO FOCUS' : 'RELEASE TO DRAW';
+      text(c, hint, cx, hintY, 14 * S, { spacing: 2 * S, weight: 400, stroke: INK, alpha: 0.9 });
+    }
+  } else if (state === 'RESULT') {
+    drawBanner(c);
+  }
+}
+
+function drawReticle(c) {
+  if (state !== 'DRAW' || !duel.drawn || duel.outcome) return;
+  const r = reticlePos(), spread = 5 * S + sway.amp * 0.35;
+  c.save(); c.translate(r.x, r.y); c.lineCap = 'round';
+  const passes = [['rgba(0,0,0,0.55)', 3.4 * S], [duel.focusing ? 'rgba(255,214,130,0.98)' : 'rgba(255,244,225,0.92)', 1.5 * S]];
+  for (const [col, lw] of passes) {
+    c.strokeStyle = col; c.fillStyle = col; c.lineWidth = lw;
+    c.beginPath(); c.arc(0, 0, spread + 5 * S, 0, TAU); c.stroke();
+    c.beginPath();
+    for (let i = 0; i < 4; i++) {
+      const a = i * Math.PI / 2, ca = Math.cos(a), sa = Math.sin(a);
+      c.moveTo(ca * (spread + 2 * S), sa * (spread + 2 * S)); c.lineTo(ca * (spread + 12 * S), sa * (spread + 12 * S));
+    }
+    c.stroke();
+    c.beginPath(); c.arc(0, 0, lw * 0.75, 0, TAU); c.fill();
+  }
+  c.restore();
+}
+
+function drawHUD(c) {
+  const m = 18 * S, y0 = 12 * S;
+
+  // Honor bar
+  text(c, 'HONOR', m, y0 + 6 * S, 12 * S, { align: 'left', spacing: 2.5 * S, color: '#e9d3a6' });
+  const bx = m, by = y0 + 17 * S, bw = 190 * S, bh = 7 * S;
+  c.fillStyle = 'rgba(0,0,0,0.6)'; c.fillRect(bx - 1.5, by - 1.5, bw + 3, bh + 3);
+  const hg = c.createLinearGradient(bx, 0, bx + bw, 0);
+  hg.addColorStop(0, '#7d2218'); hg.addColorStop(0.5, '#b98a4a'); hg.addColorStop(1, '#f0d080');
+  c.fillStyle = hg; c.fillRect(bx, by, bw * clamp(fx.honorShown, 0, 1), bh);
+  if (fx.honorFlash > 0) { c.fillStyle = `rgba(255,255,255,${fx.honorFlash * 0.5})`; c.fillRect(bx, by, bw * clamp(fx.honorShown, 0, 1), bh); }
+  c.fillStyle = 'rgba(255,240,210,0.7)'; c.fillRect(bx + bw / 2 - 0.5, by - 2 * S, 1, bh + 4 * S);
+  c.strokeStyle = 'rgba(233,211,166,0.6)'; c.lineWidth = 1; c.strokeRect(bx - 1.5, by - 1.5, bw + 3, bh + 3);
+  text(c, honorRank(), bx, by + bh + 12 * S, 11 * S, { align: 'left', style: 'italic', weight: 400, color: '#cdb68a' });
+
+  // win / loss tally
+  text(c, `WON ${store.wins}    LOST ${store.losses}`, W - m, y0 + 8 * S, 13 * S, { align: 'right', spacing: 1.5 * S, color: '#e9d3a6' });
+  text(c, CONFIG.difficulty[store.diff].label.toUpperCase() + (Sfx.isMuted() ? '  ·  MUTED' : ''), W - m, y0 + 26 * S, 11 * S, { align: 'right', color: '#cdb68a', spacing: 2 * S, weight: 400 });
+
+  // focus meter + cylinder
+  if (state === 'STARE' || state === 'DRAW') {
+    const fw = 170 * S, fh = 5 * S, fx0 = W / 2 - fw / 2, fy = H - 20 * S;
+    text(c, 'FOCUS', fx0 - 10 * S, fy + fh / 2, 10 * S, { align: 'right', spacing: 2 * S, weight: 400, color: '#cdb68a' });
+    c.fillStyle = 'rgba(0,0,0,0.6)'; c.fillRect(fx0 - 1.5, fy - 1.5, fw + 3, fh + 3);
+    c.fillStyle = duel.focusing ? '#ffe19a' : (duel.focus < CONFIG.focus.minToEngage ? '#8a3a2a' : '#c9a25a');
+    c.fillRect(fx0, fy, fw * duel.focus, fh);
+    for (let i = 0; i < CONFIG.player.ammo; i++) {
+      const x = fx0 + fw + 16 * S + i * 10 * S, y = fy + fh / 2;
+      c.beginPath(); c.arc(x, y, 3.2 * S, 0, TAU);
+      if (i < duel.ammo) { c.fillStyle = '#d8b060'; c.fill(); } else { c.strokeStyle = 'rgba(216,176,96,0.5)'; c.lineWidth = 1; c.stroke(); }
+    }
+  }
+  drawReticle(c);
+}
+
+let grainPattern = null;
+function makeGrain() {
+  const g = document.createElement('canvas'); g.width = g.height = 128;
+  const x = g.getContext('2d'), im = x.createImageData(128, 128);
+  for (let i = 0; i < 128 * 128; i++) {
+    const v = Math.random() < 0.5 ? 0 : 255;
+    im.data[i * 4] = im.data[i * 4 + 1] = im.data[i * 4 + 2] = v;
+    im.data[i * 4 + 3] = Math.random() * 15;
+  }
+  x.putImageData(im, 0, 0);
+  grainPattern = ctx.createPattern(g, 'repeat');
+}
+
+function drawPost(c) {
+  const cx = W / 2, cy = H / 2, diag = Math.hypot(W, H) / 2;
+
+  if (fx.muzzle > 0) { c.fillStyle = `rgba(255,226,170,${0.2 * fx.muzzle / 0.07})`; c.fillRect(0, 0, W, H); }
+  if (fx.focusK > 0.01) { c.fillStyle = `rgba(24,14,4,${0.22 * fx.focusK})`; c.fillRect(0, 0, W, H); }
+
+  const v = c.createRadialGradient(cx, cy, diag * (0.45 - 0.12 * fx.focusK), cx, cy, diag * 1.02);
+  v.addColorStop(0, 'rgba(10,4,2,0)'); v.addColorStop(1, `rgba(10,4,2,${0.62 + 0.25 * fx.focusK})`);
+  c.fillStyle = v; c.fillRect(0, 0, W, H);
+
+  // red vignette: flashes on a hit, lingers while wounded, floods when you fall
+  const dk = smooth(duel.deathT);
+  const wounded = duel.wounds > 0 && !duel.dead ? 0.34 + 0.1 * Math.sin(rclock * 5) : 0;
+  const rv = Math.max(fx.hurt, wounded, dk);
+  if (rv > 0.01) {
+    const r = c.createRadialGradient(cx, cy, diag * (0.5 - 0.42 * rv), cx, cy, diag);
+    r.addColorStop(0, 'rgba(150,0,0,0)'); r.addColorStop(1, `rgba(150,0,0,${0.82 * rv})`);
+    c.fillStyle = r; c.fillRect(0, 0, W, H);
+  }
+  if (dk > 0) { c.fillStyle = `rgba(30,0,0,${dk * 0.5})`; c.fillRect(0, 0, W, H); }
+
+  if (grainPattern) {
+    const ox = (Math.random() * 128) | 0, oy = (Math.random() * 128) | 0;
+    c.save(); c.translate(-ox, -oy); c.fillStyle = grainPattern; c.fillRect(ox, oy, W, H); c.restore();
+  }
+
+  if (fx.lb > 0.005) {
+    const bh = H * CONFIG.fx.letterbox * fx.lb;
+    c.fillStyle = '#060302'; c.fillRect(0, 0, W, bh); c.fillRect(0, H - bh, W, bh);
+  }
+  if (fx.fade > 0) { c.fillStyle = `rgba(4,2,1,${fx.fade})`; c.fillRect(0, 0, W, H); }
+}
+
+/* =====================================================================
+   16. RENDER
+   ===================================================================== */
+let cursorNow = '';
+function render() {
+  const c = ctx;
+  c.setTransform(DPR, 0, 0, DPR, 0, 0);
+  c.globalAlpha = 1; c.globalCompositeOperation = 'source-over';
+  c.fillStyle = '#0d0705'; c.fillRect(0, 0, W, H);
+
+  c.save();
+  const dk = smooth(duel.deathT);
+  if (dk > 0) {                                  // the camera goes down with you
+    c.translate(W / 2, H / 2); c.rotate(dk * 0.2); c.scale(1 + dk * 0.35, 1 + dk * 0.35);
+    c.translate(-W / 2, -H / 2 + dk * H * 0.1);
+  }
+  c.save(); applyWorld(c);
+  c.drawImage(bg, -PAD, -PAD, W + 2 * PAD, H + 2 * PAD);
+  drawOppShadow(c);
+  drawOpponent(c);
+  drawWeed(c);
+  drawParticles(c);
+  drawMotes(c);
+  c.restore();
+
+  c.save(); applyFg(c); drawPlayer(c); c.restore();
+  c.restore();
+
+  drawPost(c);
+  drawOverlay(c);
+  drawHUD(c);
+
+  let cur = 'none';
+  if (state === 'INTRO') cur = menuButtons().some(inRect) ? 'pointer' : 'default';
+  else if (state === 'RESULT') cur = 'default';
+  if (cur !== cursorNow) { cursorNow = cur; canvas.style.cursor = cur; }
+}
+
+/* =====================================================================
+   17. MAIN LOOP
+   ===================================================================== */
+function frame(ts) {
+  const rdt = Math.min(0.05, Math.max(0, (ts - lastTs) / 1000));
+  lastTs = ts;
+  timeScale = computeTimeScale();
+  const dt = rdt * timeScale;
+  clock += dt; rclock += rdt;
+  update(dt, rdt);
+  render();
+  requestAnimationFrame(frame);
+}
+
+loadStore();
+fx.honorShown = store.honor / CONFIG.honor.max;
+newDuel();
+input.x = window.innerWidth / 2; input.y = window.innerHeight / 2;
+resize();
+makeGrain();
+
+// test hook: open duel.html#debug to inspect state from the console
+if (location.hash.indexOf('debug') >= 0) {
+  window.__duel = {
+    CONFIG, store,
+    get state() { return state; },
+    get duel() { return duel; },
+    get timeScale() { return timeScale; },
+    aimPoint(zone) {
+      const [fx0, fy0, s] = oppFeet(), p = oppPose();
+      const pts = { head: p.head, heart: [p.lean + 0.075, 1.3], torso: [p.lean - 0.1, 1.15], leg: [p.kneeL[0], 0.3], gunArm: p.handR, hat: [p.head[0], p.head[1] + 0.2], miss: [1.5, 1.2] };
+      const q = pts[zone];
+      return worldToScreen(fx0 + q[0] * s, fy0 - q[1] * s);
+    },
+  };
+}
+
+requestAnimationFrame(ts => { lastTs = ts; requestAnimationFrame(frame); });
+})();
+</script>
+</body>
+</html>
